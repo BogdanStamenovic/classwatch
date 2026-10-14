@@ -1,0 +1,8 @@
+{
+  "uuid": "classwatch@bogdanstamenovic.github.io",
+  "name": "Classwatch",
+  "description": "Edge glow + takeover panel for the classwatch daemon. Controlled over D-Bus (io.github.bogdanstamenovic.Classwatch).",
+  "shell-version": ["51"],
+  "version": 1,
+  "url": "https://github.com/BogdanStamenovic"
+}

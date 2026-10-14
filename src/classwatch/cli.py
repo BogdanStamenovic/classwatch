@@ -327,6 +327,8 @@ class Run:
         self.cooldown_until = time.time() + self.args.cooldown
         self.follow_until = time.time() + self.args.follow
         self.shell.alert(True)
+        # Nobody pressed T: stop glowing rather than glow for the rest of the class.
+        threading.Timer(self.args.alert_timeout, lambda: self.shell.alert(False)).start()
         self.generate()
 
     def generate(self) -> None:
@@ -399,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--threads", type=int, default=8)
     r.add_argument("--threshold", type=float, default=0.5, help="Jev p(called) needed to alert")
     r.add_argument("--cooldown", type=float, default=45.0, help="seconds before another alert can fire")
+    r.add_argument("--alert-timeout", type=float, default=90.0, help="seconds the glow stays on if T is never pressed")
     r.add_argument("--follow", type=float, default=15.0, help="seconds after a call during which new speech regenerates the answer")
     r.add_argument("--replay", metavar="WAV", help="feed a 16 kHz mono wav instead of the live sink (testing)")
     r.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")

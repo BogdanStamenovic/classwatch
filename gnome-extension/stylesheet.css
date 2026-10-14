@@ -1,0 +1,42 @@
+.classwatch-edge-top {
+  background-gradient-direction: vertical;
+  background-gradient-start: rgba(255, 120, 0, 0.95);
+  background-gradient-end: rgba(255, 120, 0, 0.0);
+}
+.classwatch-edge-bottom {
+  background-gradient-direction: vertical;
+  background-gradient-start: rgba(255, 120, 0, 0.0);
+  background-gradient-end: rgba(255, 120, 0, 0.95);
+}
+.classwatch-edge-left {
+  background-gradient-direction: horizontal;
+  background-gradient-start: rgba(255, 120, 0, 0.95);
+  background-gradient-end: rgba(255, 120, 0, 0.0);
+}
+.classwatch-edge-right {
+  background-gradient-direction: horizontal;
+  background-gradient-start: rgba(255, 120, 0, 0.0);
+  background-gradient-end: rgba(255, 120, 0, 0.95);
+}
+.classwatch-panel {
+  background-color: rgba(12, 12, 16, 0.94);
+  border-radius: 0 0 18px 18px;
+  border: 2px solid rgba(255, 140, 30, 0.85);
+  border-top-width: 0;
+  padding: 18px 28px 22px 28px;
+}
+.classwatch-question {
+  font-size: 26px;
+  font-weight: bold;
+  color: #ffd9a8;
+  padding-bottom: 12px;
+}
+.classwatch-answer {
+  font-size: 22px;
+  color: #f2f2f2;
+}
+.classwatch-hint {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.45);
+  padding-top: 10px;
+}
