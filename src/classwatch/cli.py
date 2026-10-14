@@ -273,6 +273,22 @@ class Run:
         self.remote_ok = not args.local and ASR_TOKEN_FILE.exists()
         # Load the CPU fallback in the background so a dead archserver costs one chunk, not a load.
         threading.Thread(target=self._load_local, daemon=True).start()
+        if self.remote_ok:
+            threading.Thread(target=self._warm_remote, daemon=True).start()
+
+    def _warm_remote(self) -> None:
+        """Make archserver load its model now. It unloads after 15 idle minutes, and a cold
+        load takes longer than the 4 s per-chunk timeout, so the first chunk of a class used
+        to time out and push the whole next minute onto the CPU model."""
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(f"{ASR_URL}/transcribe", np.zeros(RATE // 2, np.int16).tobytes(),
+                {"X-Token": ASR_TOKEN_FILE.read_text().strip(), "Content-Type": "application/octet-stream"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                r.read()
+            log(f"whisper: archserver model warm ({time.time() - t0:.1f}s)")
+        except Exception as e:
+            log(f"whisper: archserver warm-up failed ({e!r}); chunks will retry it")
 
     def _load_local(self) -> None:
         from faster_whisper import WhisperModel
