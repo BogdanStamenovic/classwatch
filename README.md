@@ -96,9 +96,25 @@ classwatch camera up                 # terminal 1: PipeWire camera "classwatch" 
                                      # close every Chrome window
 classwatch meet https://meet.google.com/xxx-xxxx-xxx
 # in Meet: Settings > Video > Camera > "classwatch"
-classwatch run --camera              # terminal 2: when you are called on, lag 6 s, then swap to the real cam
+classwatch run --camera              # terminal 2
 classwatch camera down               # afterwards
 ```
+
+With `run --camera`, the T key drives the camera:
+
+| Press | What happens |
+|---|---|
+| T while the edge glows | Meet goes fullscreen with the answer panel; the fake link collapses (blocky, ~4-7 fps, short freezes) for 6 s, the webcam silently replaces the clip, then the link recovers over 20 s |
+| T again | Meet is minimized; the link collapses for 3 s, the clip replaces the webcam, then recovers over 6 s |
+
+The link also dips for ~2 s around every loop seam (starting 0.5 s before the wrap), so the jump
+cut reads as a network hiccup. Lag is faked by showing fewer distinct frames, never by delaying
+them, so the webcam never plays in slow motion. Measured through the PipeWire node: 30 distinct
+frames/s when clean, about 6 while collapsed.
+
+The GNOME extension changed in version 2 (the T toggle, and keeping the panel visible over a
+fullscreen Meet). GNOME on Wayland loads extension code only at login, so log out and back in
+once after updating.
 
 The clip lives at `~/.local/state/classwatch/clip.mp4` (or `CLASSWATCH_CAM_CLIP`). Without it the
 camera passes the real webcam through. Record one, sitting still, with 4:2:0 colour so ordinary
@@ -119,6 +135,7 @@ Testing without a class: `classwatch run --replay lesson.wav --dry-run` (16 kHz 
 
 ## Limitations
 
+- **During a takeover T is grabbed globally**: a `t` typed into Meet's chat hands the call back. Click the panel to hide it without giving up the call.
 - **The fake camera is only listed if it runs before Chrome starts**; `classwatch meet` refuses to open while Chrome is running (`--force` overrides).
 - The camera's bitrate drop is faked visually (blocky frames plus delay); Meet re-encodes whatever it receives.
 - **Language is forced to Serbian.** Auto-detection on 4 s chunks sometimes picked English and

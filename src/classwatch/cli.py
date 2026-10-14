@@ -217,6 +217,25 @@ class Shell:
         self.ok = not dry and self._call("Ping") is not None
         log(f"shell: extension {'connected' if self.ok else 'NOT available, using notify-send fallback'}")
 
+    def watch(self, on_signal) -> None:
+        """Call on_signal(name) for each signal the extension emits (TakeoverPressed, ReleasePressed)."""
+        if not self.ok:
+            return
+
+        def pump() -> None:
+            while True:
+                p = subprocess.Popen(["gdbus", "monitor", "--session", *DBUS[:2], *DBUS[2:]],
+                                     stdout=subprocess.PIPE, text=True)
+                assert p.stdout is not None
+                for line in p.stdout:
+                    m = re.search(rf"{re.escape(IFACE)}\.(\w+Pressed)", line)
+                    if m:
+                        on_signal(m.group(1))
+                p.wait()
+                time.sleep(2)  # gnome-shell restarted or the bus blipped; reconnect
+
+        threading.Thread(target=pump, daemon=True).start()
+
     def _call(self, method: str, *args: str):
         if self.dry:
             return None
@@ -278,10 +297,20 @@ class Run:
                                           without_timestamps=True, condition_on_previous_text=False)
         return " ".join(s.text.strip() for s in segs).strip(), "cpu"
 
+    def on_key(self, signal_name: str) -> None:
+        """T on a call drives the fake camera: takeover degrades to the webcam, T again goes back."""
+        from .camera import cmd_camera
+        if signal_name == "TakeoverPressed":
+            cmd_camera("degrade")
+        elif signal_name == "ReleasePressed":
+            cmd_camera("restore")
+
     def loop(self) -> int:
         chunk, overlap = int(self.args.chunk * RATE), int(0.5 * RATE)
         pos = 0
         threading.Thread(target=self.decider, daemon=True).start()
+        if self.args.camera:
+            self.shell.watch(self.on_key)
         log("run: listening")
         while True:
             pcm, start = self.audio.since(pos)
@@ -327,9 +356,6 @@ class Run:
         self.cooldown_until = time.time() + self.args.cooldown
         self.follow_until = time.time() + self.args.follow
         self.shell.alert(True)
-        if getattr(self.args, "camera", False):
-            from .camera import cmd_camera
-            cmd_camera("degrade")
         # Nobody pressed T: stop glowing rather than glow for the rest of the class.
         threading.Timer(self.args.alert_timeout, lambda: self.shell.alert(False)).start()
         self.generate()
@@ -424,9 +450,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
     r.add_argument("--drain", type=float, default=8.0, help="seconds to wait for answers after a replay ends")
     r.add_argument("--dry-run", action="store_true", help="no shell extension calls, just log")
-    r.add_argument("--camera", action="store_true", help="when called on, tell a running `classwatch camera up` to lag and swap to the real cam (start that first)")
+    r.add_argument("--camera", action="store_true", help="T (takeover) makes a running `classwatch camera up` lag and swap to the real cam; T again swaps back to the clip and minimizes Meet (start `camera up` first)")
     c = sub.add_parser("camera", help="fake webcam: prerecorded clip, degrades and swaps to the real cam when called on")
-    c.add_argument("action", choices=["up", "down", "degrade"])
+    c.add_argument("action", choices=["up", "down", "degrade", "restore"])
     c.add_argument("--clip", help="path to the prerecorded clip (default: state dir clip.mp4)")
     c.add_argument("--real", default="/dev/video0", help="real webcam device")
     a = sub.add_parser("audio", help="create or remove the virtual Meet output sink")

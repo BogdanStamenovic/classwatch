@@ -10,7 +10,7 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const VERSION = 'classwatch-gnome-extension 1';
+const VERSION = 'classwatch-gnome-extension 2';
 const BUS_NAME = 'io.github.bogdanstamenovic.Classwatch';
 const OBJ_PATH = '/io/github/bogdanstamenovic/Classwatch';
 const GLOW_PX = 40;
@@ -25,9 +25,11 @@ const IFACE_XML = `
       <arg type="s" name="answer" direction="in"/>
     </method>
     <method name="Takeover"/>
+    <method name="Release"/>
     <method name="Dismiss"/>
     <method name="Ping"><arg type="s" name="version" direction="out"/></method>
     <signal name="TakeoverPressed"/>
+    <signal name="ReleasePressed"/>
   </interface>
 </node>`;
 
@@ -36,6 +38,8 @@ export default class ClasswatchExtension extends Extension {
         this._question = '';
         this._answer = '';
         this._alertOn = false;
+        this._takenOver = false;
+        this._unredirectOff = false;
         this._grabAction = 0;
         this._pulseId = 0;
 
@@ -44,7 +48,12 @@ export default class ClasswatchExtension extends Extension {
 
         this._acceleratorId = global.display.connect('accelerator-activated',
             (_display, action) => {
-                if (this._grabAction && action === this._grabAction)
+                if (!this._grabAction || action !== this._grabAction)
+                    return;
+                // T toggles: take over the call, then T again hands it back.
+                if (this._takenOver)
+                    this.Release();
+                else
                     this.Takeover();
             });
         this._monitorsId = Main.layoutManager.connect('monitors-changed',
@@ -67,6 +76,7 @@ export default class ClasswatchExtension extends Extension {
 
         this._setGrab(false);
         this._stopPulse();
+        this._setUnredirect(true);
         if (this._acceleratorId) {
             global.display.disconnect(this._acceleratorId);
             this._acceleratorId = 0;
@@ -97,7 +107,9 @@ export default class ClasswatchExtension extends Extension {
             this._setGrab(true);
         } else {
             this._hideGlow();
-            this._setGrab(false);
+            // The alert timing out must not take T away in the middle of a takeover.
+            if (!this._takenOver)
+                this._setGrab(false);
         }
     }
 
@@ -112,8 +124,9 @@ export default class ClasswatchExtension extends Extension {
 
     Takeover() {
         this._alertOn = false;
+        this._takenOver = true;
         this._hideGlow();
-        this._setGrab(false);
+        this._setGrab(true);  // stays grabbed so the next T hands the call back
         try {
             this._focusMeet();
         } catch (e) {
@@ -123,11 +136,29 @@ export default class ClasswatchExtension extends Extension {
         this._dbus?.emit_signal('TakeoverPressed', null);
     }
 
-    Dismiss() {
+    Release() {
+        this._takenOver = false;
         this._alertOn = false;
         this._hideGlow();
-        this._setGrab(false);
         this._panel.hide();
+        this._setGrab(false);
+        try {
+            this._minimizeMeet();
+        } catch (e) {
+            console.error(`classwatch: minimizing meet window failed: ${e}`);
+        }
+        this._syncUnredirect();
+        this._dbus?.emit_signal('ReleasePressed', null);
+    }
+
+    Dismiss() {
+        // Hides the panel only; during a takeover T keeps working to hand the call back.
+        this._alertOn = false;
+        this._hideGlow();
+        if (!this._takenOver)
+            this._setGrab(false);
+        this._panel.hide();
+        this._syncUnredirect();
     }
 
     Ping() {
@@ -162,11 +193,35 @@ export default class ClasswatchExtension extends Extension {
         this._glow.show();
         Main.layoutManager.uiGroup.set_child_above_sibling(this._glow, null);
         this._startPulse();
+        this._syncUnredirect();
     }
 
     _hideGlow() {
         this._stopPulse();
         this._glow.hide();
+        this._syncUnredirect();
+    }
+
+    // A fullscreen window (Meet after takeover) gets scanned out directly, bypassing the
+    // compositor, and then nothing drawn by the shell shows on top of it: the panel
+    // vanished the moment Meet went fullscreen. Keep compositing on while we draw.
+    _syncUnredirect() {
+        const need = Boolean(this._glow?.visible || this._panel?.visible);
+        this._setUnredirect(!need);
+    }
+
+    _setUnredirect(allowed) {
+        if (allowed === !this._unredirectOff)
+            return;
+        try {
+            if (allowed)
+                global.compositor.enable_unredirect();
+            else
+                global.compositor.disable_unredirect();
+            this._unredirectOff = !allowed;
+        } catch (e) {
+            console.error(`classwatch: toggling unredirect failed: ${e}`);
+        }
     }
 
     _startPulse() {
@@ -251,6 +306,7 @@ export default class ClasswatchExtension extends Extension {
         this._panel.show();
         Main.layoutManager.uiGroup.set_child_above_sibling(this._panel, null);
         this._scroll.vadjustment.value = 0;
+        this._syncUnredirect();
     }
 
     _relayout() {
@@ -303,7 +359,7 @@ export default class ClasswatchExtension extends Extension {
 
     // ---- meet window ----
 
-    _focusMeet() {
+    _findMeet() {
         const windows = global.get_window_actors()
             .map(a => a.meta_window)
             .filter(w => w && w.get_window_type() === Meta.WindowType.NORMAL);
@@ -317,6 +373,20 @@ export default class ClasswatchExtension extends Extension {
                 return t.includes('Meet') || t.includes('meet.google.com');
             });
         }
+        return win ?? null;
+    }
+
+    _minimizeMeet() {
+        const win = this._findMeet();
+        if (!win)
+            return;
+        if (win.is_fullscreen())
+            win.unmake_fullscreen();
+        win.minimize();
+    }
+
+    _focusMeet() {
+        const win = this._findMeet();
         if (!win) {
             console.log('classwatch: no Meet window found');
             return;

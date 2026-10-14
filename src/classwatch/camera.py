@@ -1,12 +1,18 @@
 """Fake webcam: a PipeWire virtual camera that plays a prerecorded clip of Bogdan.
 
-When classwatch detects that Bogdan is being called on, the camera "degrades":
-frames become blocky/noisy (fake low bitrate) and arrive late (visible lag in
-Meet), then it silently swaps to the real webcam and the stream recovers.
+When Bogdan takes over (presses T), the fake link collapses: frames turn blocky,
+the picture updates a few times a second and freezes now and then, and while it
+looks broken the webcam silently replaces the clip; the link then recovers
+slowly. Pressing T again does the reverse and goes back to the clip. The link
+also dips briefly at every loop seam, so the jump cut reads as a network hiccup.
+
+Lag is faked by showing fewer distinct frames, never by delaying them: sources
+run in real time and only their newest frame is kept, so nothing plays in slow
+motion (sleeping in the frame loop did exactly that to the webcam).
 
 Architecture (no kernel module, no sudo):
-  frame source (clip via PyAV, or real /dev/videoN via ffmpeg)
-      ── BGR frames ──▶ CameraStream (pacing + degrade/recovery)
+  ClipSource (PyAV, real-time) or WebcamSource (ffmpeg v4l2)  -> newest frame
+      ── CameraStream: steady 30 Hz, Link quality q decides fps/blocks/freezes
       ── rawvideo pipe (fd 0) ──▶ gst-launch-1.0
       ──▶ pipewiresink mode=provide ──▶ PipeWire node "classwatch"
 
@@ -23,12 +29,14 @@ stores that grant up front.
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import pathlib
+import signal
 import subprocess
+import sys
 import threading
 import time
-import types
 
 import av
 import numpy as np
@@ -37,10 +45,12 @@ STATE_DIR = pathlib.Path(os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / 
 CLIP_FILE = pathlib.Path(os.environ.get("CLASSWATCH_CAM_CLIP", STATE_DIR / "clip.mp4"))
 RES = (640, 480)
 FPS = 30
-GOOD_KBPS = 2500
-BAD_KBPS = 300
-RECOVER_SECS = 20.0
-LAG_SECS = 6.0  # how long the bad-connection phase lasts before the swap
+RECOVER_SECS = 20.0  # takeover: webcam quality climbs back to clean over this long
+LAG_SECS = 6.0  # takeover: how long the bad-connection phase lasts before the swap
+RESTORE_LAG_SECS = 3.0  # back to the clip: bad link this long before the swap
+RESTORE_RECOVER_SECS = 6.0
+SEAM_LEAD_SECS = 0.5  # loop seam: the link starts dipping this long before the clip wraps
+SEAM_RECOVER_SECS = 1.6
 CAM_NAME = "classwatch"
 STREAM_PROPS = "props,media.class=Video/Source,media.role=Camera,node.description=classwatch"
 CONTROL_FILE = STATE_DIR / "cam-control"
@@ -90,29 +100,194 @@ def grant_portal_camera(app_id: str = PORTAL_APP_ID) -> str:
     return "granted"
 
 
-class CameraStream:
-    """Feeds frames into the PipeWire camera node.
+class Link:
+    """Fake network quality q in [0, 1] (1 = clean), made of overlapping dips.
 
-    Modes:
-      clip     - plays the prerecorded clip, looping, clean bitrate
-      degrade  - same clip but blocky/noisy (fake low bitrate) with injected frame delay
-      real     - the actual webcam, low bitrate at first, recovering over RECOVER_SECS
+    A dip holds q at 1 - depth for `hold` seconds, then recovers linearly over
+    `recover` seconds. The lowest active dip wins, so a takeover dip is not
+    shortened by a loop-seam dip that happens to start inside it.
+    """
+
+    def __init__(self) -> None:
+        self._dips: list[tuple[float, float, float, float]] = []
+        self._was_dipped = False
+
+    def dip(self, now: float, depth: float, hold: float, recover: float) -> None:
+        self._dips.append((now, depth, hold, recover))
+
+    def q(self, now: float) -> float:
+        q = 1.0
+        live = []
+        for start, depth, hold, recover in self._dips:
+            t = now - start
+            if t < 0:
+                live.append((start, depth, hold, recover))
+                continue
+            if t < hold:
+                v = 1.0 - depth
+            elif t < hold + recover:
+                v = 1.0 - depth * (1.0 - (t - hold) / recover)
+            else:
+                continue
+            live.append((start, depth, hold, recover))
+            q = min(q, v)
+        self._dips = live
+        return q
+
+    def recovered(self, now: float) -> bool:
+        """True exactly once each time the link returns to clean after a dip."""
+        q = self.q(now)
+        if q < 1.0:
+            self._was_dipped = True
+            return False
+        if self._was_dipped:
+            self._was_dipped = False
+            return True
+        return False
+
+
+def out_fps(q: float) -> float:
+    """Distinct frames per second shown at quality q: 4 when awful, 30 when clean."""
+    return 4.0 + (FPS - 4.0) * max(0.0, min(1.0, q))
+
+
+def render(img: np.ndarray, q: float, rng: np.random.Generator | None = None) -> np.ndarray:
+    """Make a frame look like it went through a link of quality q (blocks + noise)."""
+    if q >= 0.97:
+        return img
+    rng = rng or np.random.default_rng()
+    block = round(1 + (1.0 - q) * 9)
+    h, w = img.shape[:2]
+    small = img[::block, ::block, :].astype(np.float32)
+    out = np.repeat(np.repeat(small, block, axis=0), block, axis=1)[:h, :w]
+    noise = (rng.random((h, w, 1), dtype=np.float32) - 0.5) * (24.0 * (1.0 - q))
+    return np.clip(out + noise, 0, 255).astype(np.uint8)
+
+
+class _Source:
+    """A frame producer running in real time on its own thread; keeps only the newest frame.
+
+    Keeping only the newest frame is the point: the old design slept inside the
+    frame loop to fake lag, so the webcam's frames queued up and played back in
+    slow motion. Here a slow consumer just skips frames.
+    """
+
+    def __init__(self) -> None:
+        self._latest: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> _Source:
+        self._thread.start()
+        return self
+
+    def latest(self) -> np.ndarray | None:
+        with self._lock:
+            return self._latest
+
+    def _put(self, img: np.ndarray) -> None:
+        with self._lock:
+            self._latest = img
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=3)
+
+    def _loop(self) -> None:
+        raise NotImplementedError
+
+
+class ClipSource(_Source):
+    """Loops a clip at its real speed. Calls on_seam(lead) shortly before each wrap."""
+
+    def __init__(self, path: pathlib.Path, on_seam=None) -> None:
+        super().__init__()
+        self.path = path
+        self.on_seam = on_seam
+
+    def _loop(self) -> None:
+        frame_secs = 1.0 / FPS
+        while not self._stop.is_set():
+            # Open, decode and close all on this thread: closing a container while
+            # another thread decodes from it is what segfaulted before.
+            with av.open(str(self.path)) as c:
+                vs = c.streams.video[0]
+                dur = float(vs.duration * vs.time_base) if vs.duration else (
+                    float(c.duration) / 1e6 if c.duration else 0.0)
+                seam_fired = False
+                next_t = time.monotonic()
+                for frame in c.decode(video=0):
+                    if self._stop.is_set():
+                        return
+                    img = frame.to_ndarray(format="bgr24")
+                    if img.shape[1] != RES[0] or img.shape[0] != RES[1]:
+                        img = frame.reformat(width=RES[0], height=RES[1]).to_ndarray(format="bgr24")
+                    self._put(img)
+                    t = float(frame.time) if frame.time is not None else 0.0
+                    if self.on_seam and not seam_fired and dur and t >= dur - SEAM_LEAD_SECS:
+                        seam_fired = True
+                        self.on_seam()
+                    next_t += frame_secs
+                    sleep_for = next_t - time.monotonic()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    else:
+                        next_t = time.monotonic()
+                if self.on_seam and not seam_fired:
+                    self.on_seam()  # duration unknown: dip at the wrap itself
+
+
+class WebcamSource(_Source):
+    """Reads the real webcam through ffmpeg as fast as it delivers."""
+
+    def __init__(self, device: str) -> None:
+        super().__init__()
+        self.device = device
+        self._proc: subprocess.Popen | None = None
+
+    def _loop(self) -> None:
+        self._proc = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "v4l2", "-framerate", str(FPS), "-input_format", "mjpeg",
+             "-video_size", f"{RES[0]}x{RES[1]}", "-i", self.device,
+             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        n = RES[0] * RES[1] * 3
+        assert self._proc.stdout is not None
+        while not self._stop.is_set():
+            data = self._proc.stdout.read(n)
+            if not data or len(data) < n:
+                break
+            self._put(np.frombuffer(data, np.uint8).reshape(RES[1], RES[0], 3))
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc:
+            self._proc.kill()  # unblocks the read and frees the webcam
+        super().stop()
+
+
+class CameraStream:
+    """Feeds the PipeWire camera node at a steady 30 Hz from the current source.
+
+    Modes: clip (the prerecorded loop), degrade (takeover: link collapses, then
+    the webcam), real (the webcam), restore (link collapses, then back to the clip).
     """
 
     def __init__(self, real_device: str = "/dev/video0"):
         self.real_device = real_device
         self.mode = "clip"
+        self.clip_path: pathlib.Path | None = None
+        self.link = Link()
+        self._source: _Source | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._proc: subprocess.Popen | None = None
-        self._reader: av.container.InputContainer | None = None
-        self._gen: "types.Generator[av.VideoFrame, None, None] | None" = None
-        self._degraded_at = 0.0
-        self._recovered_logged = False
-        self._bitrate = GOOD_KBPS * 1000
-        self._delay = 0.0
+        self._timers: list[threading.Timer] = []
         self._pipe_fd = -1
         self._feeder: subprocess.Popen | None = None
+        self._rng = np.random.default_rng()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -124,43 +299,45 @@ class CameraStream:
             raise RuntimeError("gst-launch-1.0 not found (install gstreamer1.0-plugins-base)")
         clip_path = pathlib.Path(clip) if clip else CLIP_FILE
         if clip_path.exists():
-            self._set_source(clip_path, real=False)
+            self.clip_path = clip_path
+            self._use(self._clip_source())
             self.mode = "clip"
             log(f"camera: playing clip {clip_path.name}")
         else:
-            self._set_source(self.real_device, real=True)
+            self._use(WebcamSource(self.real_device))
             self.mode = "real"
             log(f"camera: no clip at {clip_path}, using real webcam {self.real_device}")
 
     def degrade(self) -> None:
-        """Called when Bogdan is called on: drop bitrate, add lag, then swap to real cam."""
-        with self._lock:
-            self.mode = "degrade"
-            self._degraded_at = time.time()
-            self._bitrate = BAD_KBPS * 1000
-            self._delay = 0.35
-            log("camera: DEGRADE (low bitrate + lag, switching to real cam)")
-        threading.Timer(LAG_SECS, self._switch_to_real).start()
+        """Takeover: the link collapses for LAG_SECS, the webcam replaces the clip, then recovers."""
+        if self.mode in ("degrade", "real"):
+            return
+        now = time.monotonic()
+        self.link.dip(now, depth=0.9, hold=LAG_SECS + 1.0, recover=RECOVER_SECS)
+        self.mode = "degrade"
+        log("camera: DEGRADE (link collapses, swapping to the real cam)")
+        self._later(LAG_SECS, self._swap_to_real)
 
-    def _switch_to_real(self) -> None:
-        with self._lock:
-            if self.mode != "degrade":
-                return
-            self.mode = "real"
-            self._delay = 0.15
-            self._degraded_at = time.time()  # recovery clock starts at the swap
-            self._recovered_logged = False
-            log("camera: switched to REAL webcam, bitrate recovering")
-        self._set_source(self.real_device, real=True)
+    def restore(self) -> None:
+        """Back to the clip: the link collapses again so the cut is hidden, then recovers."""
+        if self.mode in ("clip", "restore") or not self.clip_path:
+            return
+        now = time.monotonic()
+        self.link.dip(now, depth=0.85, hold=RESTORE_LAG_SECS + 0.8, recover=RESTORE_RECOVER_SECS)
+        self.mode = "restore"
+        log("camera: RESTORE (link collapses, swapping back to the clip)")
+        self._later(RESTORE_LAG_SECS, self._swap_to_clip)
 
     def stop(self) -> None:
         self._stop.set()
-        # The pump thread may be inside PyAV's decoder; closing the container under it
-        # segfaulted on Ctrl-C. Let the thread finish its frame, then close under the lock.
+        for t in self._timers:
+            t.cancel()
         if self._thread.is_alive() and self._thread is not threading.current_thread():
             self._thread.join(timeout=2)
         with self._lock:
-            self._stop_source()
+            if self._source:
+                self._source.stop()
+                self._source = None
         if self._pipe_fd >= 0:
             try:
                 os.close(self._pipe_fd)
@@ -175,125 +352,77 @@ class CameraStream:
             self._feeder = None
         log("camera: stopped")
 
-    # ---- source plumbing ----------------------------------------------------
+    # ---- sources ------------------------------------------------------------
 
-    def _set_source(self, source: str | pathlib.Path, real: bool) -> None:
+    def _clip_source(self) -> ClipSource:
+        assert self.clip_path is not None
+        return ClipSource(self.clip_path, on_seam=self._on_seam)
+
+    def _on_seam(self) -> None:
+        if self.mode == "clip":
+            self.link.dip(time.monotonic(), depth=0.6,
+                          hold=SEAM_LEAD_SECS + 0.4, recover=SEAM_RECOVER_SECS)
+
+    def _use(self, src: _Source) -> None:
+        src.start()
         with self._lock:
-            self._stop_source()
-            if real:
-                self._proc = subprocess.Popen(
-                    ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                     "-f", "v4l2", "-framerate", str(FPS), "-input_format", "mjpeg",
-                     "-video_size", f"{RES[0]}x{RES[1]}", "-i", str(source),
-                     "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                self._reader = None
-            else:
-                self._reader = av.open(str(source))
-                self._gen = self._reader.decode(video=0)
-                self._proc = None
-            log(f"camera: source -> {'real cam' if real else 'clip'} {source}")
+            old, self._source = self._source, src
+        if old:
+            old.stop()
 
-    def _stop_source(self) -> None:
-        if self._proc:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
-            self._proc = None
-        self._gen = None
-        if self._reader:
-            try:
-                self._reader.close()
-            except Exception:
-                pass
-            self._reader = None
+    def _later(self, secs: float, fn) -> None:
+        t = threading.Timer(secs, fn)
+        t.daemon = True
+        self._timers.append(t)
+        t.start()
 
-    # ---- frame pump ---------------------------------------------------------
-    def _recovery_step(self, now: float) -> float:
-        """Update bitrate/delay for the current mode; return the frame delay.
+    def _swap_to_real(self) -> None:
+        if self.mode != "degrade" or self._stop.is_set():
+            return
+        self._use(WebcamSource(self.real_device))
+        self.mode = "real"
+        log("camera: switched to REAL webcam, link recovering")
 
-        In "real" mode the bitrate recovers BAD -> GOOD over RECOVER_SECS
-        after the swap; the recovery-complete log line is emitted exactly once.
-        """
-        if self.mode != "real":
-            return self._delay
-        elapsed = now - self._degraded_at
-        frac = min(1.0, elapsed / RECOVER_SECS)
-        self._bitrate = int(BAD_KBPS * 1000 + (GOOD_KBPS - BAD_KBPS) * 1000 * frac)
-        self._delay = 0.15 * (1.0 - frac)
-        if frac >= 1.0 and not self._recovered_logged:
-            self._recovered_logged = True
-            log("camera: bitrate fully recovered")
-        return self._delay
+    def _swap_to_clip(self) -> None:
+        if self.mode != "restore" or self._stop.is_set():
+            return
+        self._use(self._clip_source())
+        self.mode = "clip"
+        log("camera: switched back to the CLIP, link recovering")
 
+    # ---- output -------------------------------------------------------------
 
     def _run(self) -> None:
-        """Pace frames to FPS (real time) and push them into the gst feeder."""
-        frame_secs = 1.0 / FPS
+        """Steady 30 Hz to gst; the link decides how often the shown frame changes."""
+        tick = 1.0 / FPS
         next_t = time.monotonic()
+        shown: np.ndarray | None = None
+        next_change = 0.0
+        frozen_until = 0.0
         while not self._stop.is_set():
-            frame = self._next_frame()
-            if frame is None:
-                time.sleep(0.02)
-                continue
-            with self._lock:
-                delay = self._recovery_step(time.time())
-            if delay > 0:
-                time.sleep(delay)
-            self._write_frame(frame)
-            # Pace to wall clock so the clip plays at its real speed.
-            next_t += frame_secs
+            now = time.monotonic()
+            q = self.link.q(now)
+            if self.link.recovered(now):
+                log("camera: link fully recovered")
+            if q < 0.3 and now >= frozen_until and self._rng.random() < 0.01:
+                frozen_until = now + float(self._rng.uniform(0.3, 1.2))  # a lag spike
+            # Half a tick of slack: deadlines computed from a jittery `now` otherwise miss
+            # every other 30 Hz tick, and a clean clip judders at ~18 fps.
+            if now + tick / 2 >= next_change and now >= frozen_until:
+                with self._lock:
+                    src = self._source
+                img = src.latest() if src else None
+                if img is not None:
+                    shown = render(img, q, self._rng)
+                    next_change = max(next_change + 1.0 / out_fps(q), now - tick)
+            if shown is not None:
+                self._write_frame(shown.tobytes())
+            next_t += tick
             sleep_for = next_t - time.monotonic()
             if sleep_for > 0:
                 time.sleep(sleep_for)
             else:
-                next_t = time.monotonic()  # fell behind; resync instead of bursting
-
-    def _next_frame(self) -> bytes | None:
-        with self._lock:
-            mode, reader, proc = self.mode, self._reader, self._proc
-            if mode in ("clip", "degrade") and reader is not None:
-                gen = self._gen
-                if gen is None:
-                    return None
-                try:
-                    frame = next(gen)
-                except StopIteration:
-                    # clip exhausted: close and reopen to loop
-                    try:
-                        path = reader.name
-                        reader.close()
-                        reader = av.open(path)
-                        self._reader = reader
-                        self._gen = reader.decode(video=0)
-                        frame = next(self._gen)
-                    except Exception:
-                        return None
-                except av.error.EOFError:
-                    # decoder flush: treat as end of clip, loop
-                    return None
-                except Exception:
-                    return None
-                img = frame.to_ndarray(format="bgr24")
-                if mode == "degrade":
-                    img = self._degrade_image(img)
-                return img.tobytes()
-            if mode == "real" and proc is not None:
-                n = RES[0] * RES[1] * 3
-                data = proc.stdout.read(n)
-                if data and len(data) == n:
-                    return data
-        return None
-
-    @staticmethod
-    def _degrade_image(img: np.ndarray) -> np.ndarray:
-        """Cheap fake of a low-bitrate stream: blocky downscale-upscale + noise."""
-        h, w = img.shape[:2]
-        small = img[::4, ::4, :].astype(np.float32)
-        blocky = np.repeat(np.repeat(small, 4, axis=0), 4, axis=1)[:h, :w]
-        noise = (np.random.rand(h, w, 1).astype(np.float32) - 0.5) * 18
-        return np.clip(blocky + noise, 0, 255).astype(np.uint8)
+                next_t = time.monotonic()
 
     def _write_frame(self, frame: bytes) -> None:
         """Push one BGR frame into the gst feeder's stdin."""
@@ -337,22 +466,43 @@ class CameraStream:
 
 
 def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") -> int:
-    """Manage the fake camera: up / down / degrade."""
+    """Manage the fake camera: up / down / degrade / restore."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if action == "up":
+        # One camera at a time: two would publish two "classwatch" nodes and race for
+        # the control file.
+        lock = open(STATE_DIR / "camera.lock", "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("classwatch: a `camera up` is already running (stop it with `classwatch camera down`)",
+                  file=sys.stderr)
+            return 1
+        # Ctrl-C and systemctl stop (SIGTERM) take the same clean path. SIGINT is set
+        # explicitly because a shell starting us in the background leaves it ignored.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         cam = CameraStream(real_device=real)
         try:
             cam.start(clip)
         except Exception as e:
             log(f"camera: {e}")
+            cam.stop()
             return 1
-        # Watch for the degrade signal from the main classwatch run.
+        # `classwatch run` asks for degrade (takeover) and restore (back to the clip) here.
         try:
             while True:
-                if CONTROL_FILE.exists() and "degrade" in CONTROL_FILE.read_text():
+                try:
+                    cmd = CONTROL_FILE.read_text().strip()
                     CONTROL_FILE.unlink()
-                    cam.degrade()
-                time.sleep(0.5)
+                except FileNotFoundError:
+                    cmd = ""
+                if cmd:
+                    if cmd == "degrade":
+                        cam.degrade()
+                    elif cmd == "restore":
+                        cam.restore()
+                time.sleep(0.2)
         except KeyboardInterrupt:
             pass
         finally:
@@ -361,13 +511,13 @@ def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") 
     if action == "down":
         # Stop `camera up` first (SIGINT = its clean Ctrl-C path); killing only the
         # gst feeder just makes `up` respawn it.
-        subprocess.run(["pkill", "-INT", "-f", "classwatch camera up"], capture_output=True)
+        subprocess.run(["pkill", "-TERM", "-f", "classwatch(.cli)? camera up"], capture_output=True)
         time.sleep(2.5)
         subprocess.run(["pkill", "-f", f"client-name={CAM_NAME}-cam"], capture_output=True)
         log("camera: stopped PipeWire camera node")
         return 0
-    if action == "degrade":
-        CONTROL_FILE.write_text("degrade")
-        log("camera: degrade requested")
+    if action in ("degrade", "restore"):
+        CONTROL_FILE.write_text(action)
+        log(f"camera: {action} requested")
         return 0
     return 1
