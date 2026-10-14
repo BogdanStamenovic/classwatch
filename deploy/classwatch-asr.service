@@ -1,0 +1,11 @@
+[Unit]
+Description=classwatch GPU transcription server (laptop posts audio chunks here)
+After=tailscaled.service
+
+[Service]
+ExecStart=%h/data/classwatch/.venv/bin/classwatch serve-asr
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
