@@ -87,12 +87,40 @@ classwatch status                                       # sink, key, archserver,
 classwatch audio down                                   # remove the virtual sink afterwards
 ```
 
+### Fake camera
+
+Order matters, because Chrome only lists the cameras that exist when it starts:
+
+```
+classwatch camera up                 # terminal 1: PipeWire camera "classwatch" playing the clip
+                                     # close every Chrome window
+classwatch meet https://meet.google.com/xxx-xxxx-xxx
+# in Meet: Settings > Video > Camera > "classwatch"
+classwatch run --camera              # terminal 2: when you are called on, lag 6 s, then swap to the real cam
+classwatch camera down               # afterwards
+```
+
+The clip lives at `~/.local/state/classwatch/clip.mp4` (or `CLASSWATCH_CAM_CLIP`). Without it the
+camera passes the real webcam through. Record one, sitting still, with 4:2:0 colour so ordinary
+players can open it too:
+
+```
+ffmpeg -f v4l2 -input_format mjpeg -video_size 640x480 -framerate 30 -i /dev/video0 -t 60 -pix_fmt yuv420p ~/.local/state/classwatch/clip.mp4
+```
+
+`classwatch meet` grants Chrome (`com.google.Chrome`) camera access in the portal permission store.
+Without that grant, GNOME refuses to show the permission dialog for Chrome and Meet's Settings and
+Join buttons silently do nothing. Undo:
+`gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore --object-path /org/freedesktop/impl/portal/PermissionStore --method org.freedesktop.impl.portal.PermissionStore.DeletePermission devices camera com.google.Chrome`
+
 Logs: `~/.local/state/classwatch/` (`session.log`, `transcript.txt`, `answers.log`).
 
 Testing without a class: `classwatch run --replay lesson.wav --dry-run` (16 kHz mono wav).
 
 ## Limitations
 
+- **The fake camera is only listed if it runs before Chrome starts**; `classwatch meet` refuses to open while Chrome is running (`--force` overrides).
+- The camera's bitrate drop is faked visually (blocky frames plus delay); Meet re-encodes whatever it receives.
 - **Language is forced to Serbian.** Auto-detection on 4 s chunks sometimes picked English and
   then *translated* the Serbian speech, which can drop the name. Forced `sr` still writes
   English sentences in English, but an English-only class would transcribe worse.

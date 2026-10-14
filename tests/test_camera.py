@@ -102,3 +102,20 @@ def test_recovery_logs_once(tmp_path, monkeypatch):
         assert stream._bitrate == GOOD_KBPS * 1000
     finally:
         stream.stop()
+
+
+def test_portal_grant_present():
+    from classwatch.camera import portal_grant_present
+    assert portal_grant_present("({'com.google.Chrome': ['yes'], 'org.gnome.Snapshot': ['yes']}, <byte 0x00>)")
+    assert not portal_grant_present("({'org.gnome.Snapshot': ['yes']}, <byte 0x00>)")
+    assert not portal_grant_present("({'com.google.Chrome': ['no']}, <byte 0x00>)")
+
+
+def test_stop_waits_for_pump_thread(tmp_path, monkeypatch):
+    """stop() must not close the decoder while the pump thread can still be inside it
+    (that segfaulted on Ctrl-C), so the thread has to be finished when stop() returns."""
+    import classwatch.camera as cam
+    monkeypatch.setattr(cam, "STATE_DIR", tmp_path)
+    stream = cam.CameraStream()
+    stream.stop()
+    assert not stream._thread.is_alive()

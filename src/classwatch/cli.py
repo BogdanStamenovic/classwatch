@@ -258,7 +258,7 @@ class Run:
     def _load_local(self) -> None:
         from faster_whisper import WhisperModel
         self.whisper = WhisperModel(self.args.model, device="cpu", compute_type="int8", cpu_threads=self.args.threads)
-        log(f"whisper: local fallback {self.args.model} loaded")
+        log(f"whisper: CPU standby {self.args.model} preloaded (archserver GPU is primary)" if self.remote_ok else f"whisper: local {self.args.model} loaded (archserver not configured)")
 
     def transcribe(self, pcm: np.ndarray) -> tuple[str, str]:
         if self.remote_ok or time.time() - getattr(self, "remote_failed_at", 0) > 60:
@@ -366,15 +366,28 @@ class Run:
             f.write(f"{time.strftime('%H:%M:%S')} {model}: {text!r}\n")
 
 
-def cmd_meet(url: str) -> int:
+def cmd_meet(url: str, force: bool = False) -> int:
+    from .camera import CAM_NAME, grant_portal_camera, node_in_wpctl
+
     chrome = shutil.which("google-chrome-stable") or shutil.which("google-chrome")
     if not chrome:
         print("classwatch: google-chrome not found", file=sys.stderr)
         return 1
+    # A running Chrome swallows the launch: the new window joins the old process, which
+    # was started without the PipeWire camera flag and enumerated cameras long ago.
+    if subprocess.run(["pgrep", "-f", "^/opt/google/chrome/chrome"], capture_output=True).returncode == 0 and not force:
+        print("classwatch: Chrome is already running, so the fake camera would not be listed.\n"
+              "Close every Chrome window first (or pass --force to open Meet anyway).", file=sys.stderr)
+        return 1
+    if not node_in_wpctl(CAM_NAME):
+        print(f"classwatch: warning: the '{CAM_NAME}' camera is not running; Chrome only lists cameras\n"
+              "present at startup. Run `classwatch camera up` first if you want it.", file=sys.stderr)
+    print(f"camera portal permission for Chrome: {grant_portal_camera()}")
     subprocess.Popen([chrome, f"--app={url}", "--class=classwatch-meet",
                      "--enable-features=WebRtcPipeWireCamera"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    print("Meet opened. In Meet: Settings > Audio > Speaker > 'classwatch'.")
+    print("Meet opened. In Meet: Settings > Video > Camera > 'classwatch'; "
+          "Settings > Audio > Speaker > 'classwatch' (once `classwatch run` has created the sink).")
     return 0
 
 
@@ -411,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
     r.add_argument("--drain", type=float, default=8.0, help="seconds to wait for answers after a replay ends")
     r.add_argument("--dry-run", action="store_true", help="no shell extension calls, just log")
-    r.add_argument("--camera", action="store_true", help="also run the fake webcam: prerecorded clip, degrade+swap to real cam when called on")
+    r.add_argument("--camera", action="store_true", help="when called on, tell a running `classwatch camera up` to lag and swap to the real cam (start that first)")
     c = sub.add_parser("camera", help="fake webcam: prerecorded clip, degrades and swaps to the real cam when called on")
     c.add_argument("action", choices=["up", "down", "degrade"])
     c.add_argument("--clip", help="path to the prerecorded clip (default: state dir clip.mp4)")
@@ -420,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("action", choices=["up", "down"])
     m = sub.add_parser("meet", help="open a Meet link as its own Chrome app window")
     m.add_argument("url")
+    m.add_argument("--force", action="store_true", help="open even if Chrome is already running (fake camera will not be listed)")
     sub.add_parser("status", help="show what is set up and the last log lines")
     sv = sub.add_parser("serve-asr", help="run the GPU transcription server (archserver)")
     sv.add_argument("--host", default="100.72.2.62")
@@ -435,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
             from .camera import cmd_camera
             return cmd_camera(args.action, clip=args.clip, real=args.real)
         if args.cmd == "meet":
-            return cmd_meet(args.url)
+            return cmd_meet(args.url, force=args.force)
         if args.cmd == "status":
             return cmd_status()
         if args.cmd == "serve-asr":

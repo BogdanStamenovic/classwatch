@@ -13,7 +13,13 @@ Architecture (no kernel module, no sudo):
 The node advertises media.class=Video/Source, media.role=Camera, so it shows up
 in `wpctl status` under Video > Sources next to the real webcam. Chrome only
 sees PipeWire cameras with --enable-features=WebRtcPipeWireCamera (added in
-`classwatch meet`).
+`classwatch meet`), and only lists the cameras present when Chrome starts.
+
+That flag routes Chrome through the xdg camera portal. GNOME refuses to show
+the portal's permission dialog for Chrome ("Only the focused app is allowed to
+show a system access dialog"), so without a stored grant Chrome waits forever
+and Meet's Settings and Join buttons silently do nothing. `grant_portal_camera`
+stores that grant up front.
 """
 from __future__ import annotations
 
@@ -56,6 +62,32 @@ def node_in_wpctl(name: str = CAM_NAME) -> bool:
     """True if a PipeWire node with this name is currently registered."""
     r = subprocess.run(["wpctl", "status"], capture_output=True, text=True)
     return name in r.stdout
+
+
+# The portal derives a host app's id from its systemd scope (app-com.google.Chrome-N.scope);
+# an empty id, which older portals used for unsandboxed apps, is not consulted.
+PORTAL_APP_ID = "com.google.Chrome"
+_PERM_STORE = ["gdbus", "call", "--session", "--dest", "org.freedesktop.impl.portal.PermissionStore",
+               "--object-path", "/org/freedesktop/impl/portal/PermissionStore", "--method"]
+_PERM_IFACE = "org.freedesktop.impl.portal.PermissionStore"
+
+
+def portal_grant_present(lookup_output: str, app_id: str = PORTAL_APP_ID) -> bool:
+    """Parse `PermissionStore.Lookup devices camera` output for a 'yes' grant to app_id."""
+    return f"'{app_id}': ['yes']" in lookup_output
+
+
+def grant_portal_camera(app_id: str = PORTAL_APP_ID) -> str:
+    """Make sure the camera portal will not need a dialog for Chrome. Returns what happened."""
+    r = subprocess.run(_PERM_STORE + [f"{_PERM_IFACE}.Lookup", "devices", "camera"],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and portal_grant_present(r.stdout, app_id):
+        return "already granted"
+    r = subprocess.run(_PERM_STORE + [f"{_PERM_IFACE}.SetPermission", "devices", "true", "camera",
+                                      app_id, "['yes']"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return f"could not grant ({r.stderr.strip() or r.returncode})"
+    return "granted"
 
 
 class CameraStream:
@@ -123,7 +155,12 @@ class CameraStream:
 
     def stop(self) -> None:
         self._stop.set()
-        self._stop_source()
+        # The pump thread may be inside PyAV's decoder; closing the container under it
+        # segfaulted on Ctrl-C. Let the thread finish its frame, then close under the lock.
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+        with self._lock:
+            self._stop_source()
         if self._pipe_fd >= 0:
             try:
                 os.close(self._pipe_fd)
@@ -322,8 +359,11 @@ def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") 
             cam.stop()
         return 0
     if action == "down":
+        # Stop `camera up` first (SIGINT = its clean Ctrl-C path); killing only the
+        # gst feeder just makes `up` respawn it.
+        subprocess.run(["pkill", "-INT", "-f", "classwatch camera up"], capture_output=True)
+        time.sleep(2.5)
         subprocess.run(["pkill", "-f", f"client-name={CAM_NAME}-cam"], capture_output=True)
-        time.sleep(0.5)
         log("camera: stopped PipeWire camera node")
         return 0
     if action == "degrade":
