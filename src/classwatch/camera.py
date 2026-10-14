@@ -458,9 +458,11 @@ class CameraStream:
              "!",
              "videoconvert",
              "!",
-             # Offer I420, not the BGR we feed in: Chrome read the node's packed 24-bit
-             # BGR as RGB, so red and blue swapped and skin came out blue in Meet.
-             "video/x-raw,format=I420",
+             # Offer YUY2, not the BGR we feed in. Measured against Chrome's PipeWire capture
+             # (headless Chrome, getUserMedia on a test node): BGR came out red/blue swapped
+             # (blue skin in Meet), I420 and NV12 gave 2x2 black frames, RGB no frames;
+             # YUY2 gave 640x480 with the clip's colours.
+             "video/x-raw,format=YUY2",
              "!",
              "pipewiresink", "mode=provide", f"client-name={CAM_NAME}-cam",
              f"stream-properties={STREAM_PROPS}"],

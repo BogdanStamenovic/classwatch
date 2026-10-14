@@ -1,0 +1,25 @@
+<!doctype html><html><body><video id=v autoplay muted playsinline></video><canvas id=c width=160 height=120></canvas>
+<script>
+const log = m => console.log("CWTEST " + m);
+(async () => {
+  try {
+    const s0 = await navigator.mediaDevices.getUserMedia({video: true});
+    s0.getTracks().forEach(t => t.stop());
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+    log("devices: " + devs.map(d => d.label).join(" | "));
+    const d = devs.find(d => d.label.includes("cwtest"));
+    if (!d) { log("RESULT no-cwtest-device"); return; }
+    const s = await navigator.mediaDevices.getUserMedia({video: {deviceId: {exact: d.deviceId}}});
+    const v = document.getElementById("v"); v.srcObject = s;
+    const t0 = performance.now();
+    while (v.videoWidth === 0 && performance.now() - t0 < 6000) await new Promise(r => setTimeout(r, 100));
+    if (v.videoWidth === 0) { log("RESULT no-frames"); return; }
+    await new Promise(r => setTimeout(r, 1500));
+    const c = document.getElementById("c").getContext("2d"); c.drawImage(v, 0, 0, 160, 120);
+    const px = c.getImageData(0, 0, 160, 120).data; let r = 0, g = 0, b = 0;
+    for (let i = 0; i < px.length; i += 4) { r += px[i]; g += px[i+1]; b += px[i+2]; }
+    const n = px.length / 4;
+    log(`RESULT frames ${v.videoWidth}x${v.videoHeight} meanRGB ${(r/n).toFixed(1)} ${(g/n).toFixed(1)} ${(b/n).toFixed(1)}`);
+  } catch (e) { log("RESULT error " + e.name + ": " + e.message); }
+})();
+</script></body></html>
