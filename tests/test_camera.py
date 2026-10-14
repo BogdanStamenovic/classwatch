@@ -8,7 +8,7 @@ import time
 import av
 import numpy as np
 
-from classwatch.camera import CameraStream, RES
+from classwatch.camera import CameraStream, RECOVER_SECS, RES, log
 
 
 def make_clip(path: pathlib.Path) -> None:
@@ -79,5 +79,27 @@ def test_recovery_curve():
         frac = min(1.0, elapsed / RECOVER_SECS)
         bitrate = int(BAD_KBPS * 1000 + (GOOD_KBPS - BAD_KBPS) * 1000 * frac)
         assert frac == 1.0 and bitrate == GOOD_KBPS * 1000
+    finally:
+        cam.stop()
+
+
+def test_recovery_logs_once(tmp_path, monkeypatch):
+    """After full recovery, the log line must appear exactly once, not per frame."""
+    import classwatch.camera as cam
+    log_file = tmp_path / "camera.log"
+    monkeypatch.setattr(cam, "STATE_DIR", tmp_path)
+    cam = cam.CameraStream()
+    try:
+        cam.mode = "real"
+        cam._degraded_at = time.time() - 100  # well past recovery
+        for _ in range(60):  # simulate 60 frames at steady state
+            with cam._lock:
+                elapsed = time.time() - cam._degraded_at
+                frac = min(1.0, elapsed / RECOVER_SECS)
+                if frac >= 1.0 and not cam._recovered_logged:
+                    cam._recovered_logged = True
+                    log("camera: bitrate fully recovered")
+        lines = log_file.read_text().splitlines()
+        assert sum("fully recovered" in l for l in lines) == 1
     finally:
         cam.stop()

@@ -76,6 +76,7 @@ class CameraStream:
         self._reader: av.container.InputContainer | None = None
         self._gen: "types.Generator[av.VideoFrame, None, None] | None" = None
         self._degraded_at = 0.0
+        self._recovered_logged = False
         self._bitrate = GOOD_KBPS * 1000
         self._delay = 0.0
         self._pipe_fd = -1
@@ -115,7 +116,8 @@ class CameraStream:
                 return
             self.mode = "real"
             self._delay = 0.15
-            self._degraded_at = time.time()
+            self._degraded_at = time.time()  # recovery clock starts at the swap
+            self._recovered_logged = False
             log("camera: switched to REAL webcam, bitrate recovering")
         self._set_source(self.real_device, real=True)
 
@@ -189,7 +191,8 @@ class CameraStream:
                     frac = min(1.0, elapsed / RECOVER_SECS)
                     self._bitrate = int(BAD_KBPS * 1000 + (GOOD_KBPS - BAD_KBPS) * 1000 * frac)
                     self._delay = 0.15 * (1.0 - frac)
-                    if frac >= 1.0:
+                    if frac >= 1.0 and not self._recovered_logged:
+                        self._recovered_logged = True
                         log("camera: bitrate fully recovered")
             if delay > 0:
                 time.sleep(delay)
