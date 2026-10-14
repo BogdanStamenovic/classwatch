@@ -327,6 +327,9 @@ class Run:
         self.cooldown_until = time.time() + self.args.cooldown
         self.follow_until = time.time() + self.args.follow
         self.shell.alert(True)
+        if getattr(self.args, "camera", False):
+            from .camera import cmd_camera
+            cmd_camera("degrade")
         # Nobody pressed T: stop glowing rather than glow for the rest of the class.
         threading.Timer(self.args.alert_timeout, lambda: self.shell.alert(False)).start()
         self.generate()
@@ -368,7 +371,8 @@ def cmd_meet(url: str) -> int:
     if not chrome:
         print("classwatch: google-chrome not found", file=sys.stderr)
         return 1
-    subprocess.Popen([chrome, f"--app={url}", "--class=classwatch-meet"],
+    subprocess.Popen([chrome, f"--app={url}", "--class=classwatch-meet",
+                     "--enable-features=WebRtcPipeWireCamera"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     print("Meet opened. In Meet: Settings > Audio > Speaker > 'classwatch'.")
     return 0
@@ -407,6 +411,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
     r.add_argument("--drain", type=float, default=8.0, help="seconds to wait for answers after a replay ends")
     r.add_argument("--dry-run", action="store_true", help="no shell extension calls, just log")
+    r.add_argument("--camera", action="store_true", help="also run the fake webcam: prerecorded clip, degrade+swap to real cam when called on")
+    c = sub.add_parser("camera", help="fake webcam: prerecorded clip, degrades and swaps to the real cam when called on")
+    c.add_argument("action", choices=["up", "down", "degrade"])
+    c.add_argument("--clip", help="path to the prerecorded clip (default: state dir clip.mp4)")
+    c.add_argument("--real", default="/dev/video0", help="real webcam device")
     a = sub.add_parser("audio", help="create or remove the virtual Meet output sink")
     a.add_argument("action", choices=["up", "down"])
     m = sub.add_parser("meet", help="open a Meet link as its own Chrome app window")
@@ -422,6 +431,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "audio":
             setup_audio() if args.action == "up" else teardown_audio()
             return 0
+        if args.cmd == "camera":
+            from .camera import cmd_camera
+            return cmd_camera(args.action, clip=args.clip, real=args.real)
         if args.cmd == "meet":
             return cmd_meet(args.url)
         if args.cmd == "status":

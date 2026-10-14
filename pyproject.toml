@@ -3,7 +3,7 @@ name = "classwatch"
 version = "0.1.0"
 description = "Listen to an online class and have an answer ready when you are called on"
 requires-python = ">=3.12"
-dependencies = ["faster-whisper", "numpy"]
+dependencies = ["faster-whisper", "numpy", "av"]
 
 [project.scripts]
 classwatch = "classwatch.cli:main"
@@ -11,3 +11,8 @@ classwatch = "classwatch.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
