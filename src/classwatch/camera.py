@@ -458,6 +458,10 @@ class CameraStream:
              "!",
              "videoconvert",
              "!",
+             # Offer I420, not the BGR we feed in: Chrome read the node's packed 24-bit
+             # BGR as RGB, so red and blue swapped and skin came out blue in Meet.
+             "video/x-raw,format=I420",
+             "!",
              "pipewiresink", "mode=provide", f"client-name={CAM_NAME}-cam",
              f"stream-properties={STREAM_PROPS}"],
             stdin=r, stdout=subprocess.DEVNULL, stderr=errlog)
