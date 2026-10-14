@@ -84,18 +84,29 @@ def sink_exists() -> bool:
     return any(line.split("\t")[1] == SINK for line in pactl("list", "short", "sinks").splitlines() if "\t" in line)
 
 
+def loopback_exists() -> bool:
+    return f"source={SINK}.monitor" in pactl("list", "short", "modules")
+
+
 def setup_audio() -> None:
+    # Each half is checked on its own: a sink without its loopback means a silent class.
+    real = pactl("get-default-sink").strip()
+    if real == SINK:
+        raise RuntimeError(f"default sink is '{SINK}' itself; set your real speakers as default first")
     if sink_exists():
         log(f"audio: sink '{SINK}' already exists")
-        return
-    real = pactl("get-default-sink").strip()
-    pactl("load-module", "module-null-sink", f"sink_name={SINK}",
-          f"sink_properties=device.description=classwatch_(Meet_output)")
-    # Loop back to the real speakers so he still hears the class.
-    pactl("load-module", "module-loopback", f"source={SINK}.monitor", f"sink={real}", "latency_msec=30")
-    # The null sink must not become the default, or every app goes through it.
-    pactl("set-default-sink", real)
-    log(f"audio: created sink '{SINK}', looped back to {real}. In Meet: Settings > Audio > Speaker > 'classwatch'")
+    else:
+        pactl("load-module", "module-null-sink", f"sink_name={SINK}",
+              "sink_properties=device.description=classwatch_(Meet_output)")
+        # The null sink must not become the default, or every app goes through it.
+        pactl("set-default-sink", real)
+        log(f"audio: created sink '{SINK}'. In Meet: Settings > Audio > Speaker > 'classwatch'")
+    if loopback_exists():
+        log("audio: loopback to speakers already exists")
+    else:
+        # Loop back to the real speakers so he still hears the class.
+        pactl("load-module", "module-loopback", f"source={SINK}.monitor", f"sink={real}", "latency_msec=30")
+        log(f"audio: looped '{SINK}' back to {real}")
 
 
 def teardown_audio() -> None:
