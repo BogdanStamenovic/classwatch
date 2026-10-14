@@ -173,6 +173,23 @@ class CameraStream:
             self._reader = None
 
     # ---- frame pump ---------------------------------------------------------
+    def _recovery_step(self, now: float) -> float:
+        """Update bitrate/delay for the current mode; return the frame delay.
+
+        In "real" mode the bitrate recovers BAD -> GOOD over RECOVER_SECS
+        after the swap; the recovery-complete log line is emitted exactly once.
+        """
+        if self.mode != "real":
+            return self._delay
+        elapsed = now - self._degraded_at
+        frac = min(1.0, elapsed / RECOVER_SECS)
+        self._bitrate = int(BAD_KBPS * 1000 + (GOOD_KBPS - BAD_KBPS) * 1000 * frac)
+        self._delay = 0.15 * (1.0 - frac)
+        if frac >= 1.0 and not self._recovered_logged:
+            self._recovered_logged = True
+            log("camera: bitrate fully recovered")
+        return self._delay
+
 
     def _run(self) -> None:
         """Pace frames to FPS (real time) and push them into the gst feeder."""
@@ -184,16 +201,7 @@ class CameraStream:
                 time.sleep(0.02)
                 continue
             with self._lock:
-                delay = self._delay
-                if self.mode == "real":
-                    # Bitrate recovers slowly: BAD -> GOOD over RECOVER_SECS.
-                    elapsed = time.time() - self._degraded_at
-                    frac = min(1.0, elapsed / RECOVER_SECS)
-                    self._bitrate = int(BAD_KBPS * 1000 + (GOOD_KBPS - BAD_KBPS) * 1000 * frac)
-                    self._delay = 0.15 * (1.0 - frac)
-                    if frac >= 1.0 and not self._recovered_logged:
-                        self._recovered_logged = True
-                        log("camera: bitrate fully recovered")
+                delay = self._recovery_step(time.time())
             if delay > 0:
                 time.sleep(delay)
             self._write_frame(frame)
