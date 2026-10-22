@@ -95,11 +95,11 @@ def test_degrade_then_restore_round_trip(tmp_path, monkeypatch):
         assert stream.mode == "clip"
         stream.degrade()
         assert stream.mode == "degrade"
-        time.sleep(1.0)  # the swap lands inside the drop's first freeze, at most ~0.6 s in
+        time.sleep(1.8)  # the swap lands inside the intro's second spike, at most ~1.6 s in
         assert stream.mode == "real"
         stream.restore()
         assert stream.mode == "restore"
-        time.sleep(1.0)
+        time.sleep(1.8)
         assert stream.mode == "clip"
     finally:
         stream.stop()
@@ -171,7 +171,7 @@ def test_record_while_real_starts_at_once(tmp_path, monkeypatch):
     try:
         stream.start(str(clip))
         stream.degrade()
-        time.sleep(1.0)
+        time.sleep(1.8)
         assert stream.mode == "real"
         stream.record(secs=0.5)
         assert stream.mode == "real"
@@ -191,9 +191,9 @@ def test_restore_during_recording_cancels_and_keeps_old_clip(tmp_path, monkeypat
     try:
         stream.start(str(clip))
         stream.record(secs=5.0)
-        time.sleep(1.2)  # swapped to the webcam, recording
+        time.sleep(2.0)  # swapped to the webcam, recording
         stream.restore()  # Ctrl+D closing the mic
-        time.sleep(1.0)
+        time.sleep(1.8)
         assert stream.mode == "clip"
     finally:
         stream.stop()
@@ -211,10 +211,10 @@ def test_record_during_restore_lag_stays_on_webcam(tmp_path, monkeypatch):
     try:
         stream.start(str(clip))
         stream.degrade()
-        time.sleep(1.0)
+        time.sleep(1.8)
         stream.restore()
         stream.record(secs=2.0)
-        time.sleep(1.0)  # past the restore swap, which must have been called off
+        time.sleep(1.8)  # past the restore swap, which must have been called off
         assert stream.mode == "real"
     finally:
         stream.stop()
@@ -227,8 +227,20 @@ def test_every_switch_swaps_early_inside_a_freeze():
     for seed in range(20):
         for name in SWITCH_SCENARIOS:
             d = MeetDrop(np.random.default_rng(seed), name)
-            assert d.swap_at <= 0.8, (name, seed, d.swap_at)
+            assert d.swap_at <= 1.6, (name, seed, d.swap_at)
             assert d.at(d.swap_at)[0], f"{name} seed {seed}: swap not hidden by a freeze"
+
+
+def test_switch_intro_spike_blocks_spike_then_blocks_sharpen():
+    from classwatch.degrade import MeetDrop
+    for seed in range(10):
+        d = MeetDrop(np.random.default_rng(seed))
+        assert d.at(d.spike1_end / 2)[0]                                   # lag spike
+        frozen, h, _, _ = d.at((d.spike1_end + d.px_end) / 2)
+        assert not frozen and h < 0.1                                      # sudden macroblocks
+        assert d.px_end < d.swap_at < d.intro_end and d.at(d.swap_at)[0]  # swap inside spike 2
+        hs = [d.at(t)[1] for t in np.arange(d.intro_end, d.intro_end + 5, 0.1) if not d.at(t)[0]]
+        assert hs[0] < 0.1 and max(hs) > 0.5                               # arrives blocky, sharpens
 
 
 def test_drop_never_beats_the_rest_state_and_returns_to_it():

@@ -27,6 +27,14 @@ TAIL_SECS = 3.0  # the last stretch of a trace eases back to clean so the drop a
 # show the jump on a moving picture, so they are not used for switching.
 SWITCH_SCENARIOS = ("sudden-drop", "loss-burst", "lag-spike", "stall-2s", "stall-5s")
 SWAP_INTO_FREEZE = 0.25  # how far into the first freeze the source swaps
+# Switch intro: lag spike, sudden macroblocks, a second short spike with the swap inside it,
+# and the new picture arriving still as macroblocks. A hard cut from one sharp picture to a
+# differently posed and lit one is what the eye catches; behind blocks it reads as the link.
+MACROBLOCK_HR = (0.04, 0.065)  # encode height ratio while pixelated: 640 wide -> 26-42 px wide
+MACROBLOCK_HOLD = 0.5  # the new picture stays this long at full pixelation after the swap
+MACROBLOCK_RAMP = 3.5  # then sharpens in steps over this long
+MACROBLOCK_STEPS = 7
+NEAREST_BELOW = 0.3  # encode heights below this ratio are upscaled as hard blocks, not blurred
 
 
 State = tuple[bool, float, float, float]  # (frozen, height ratio, fps, q-index)
@@ -69,9 +77,22 @@ class MeetDrop:
     """One drop: a measured scenario, stretched in time and shifted in quality at random."""
 
     def __init__(self, rng: np.random.Generator, scenario: str | None = None, severity: float = 1.0,
-                 max_secs: float | None = None, lead_freeze: float = 0.0):
+                 max_secs: float | None = None, lead_freeze: float = 0.0, intro: bool | None = None):
         self.name = scenario or str(rng.choice(SWITCH_SCENARIOS))
         raw = TRACES[self.name]
+        self.intro = (not lead_freeze) if intro is None else intro
+        if self.intro:
+            f1, px, f2 = rng.uniform(0.3, 0.5), rng.uniform(0.4, 0.7), rng.uniform(0.25, 0.4)
+            self.spike1_end = float(f1)
+            self.px_end = float(f1 + px)
+            self.intro_end = float(f1 + px + f2)
+            self.mb_hr = float(rng.uniform(*MACROBLOCK_HR))
+            # The scenario's own opening freeze is replaced by the intro; it plays from the first
+            # decoded frame after that freeze (stall-5s decodes one sample before it stalls).
+            fz = next((k for k, s in enumerate(raw) if s[2] < 0.5), 0)
+            first = next(k for k, s in enumerate(raw) if k > fz and s[2] >= 0.5)
+            t1 = raw[first][0]
+            raw = [[s[0] - t1, *s[1:]] for s in raw[first:]]
         if lead_freeze:
             # A freeze up front (loop seams), then the scenario from its first decoded frame on.
             first = next(k for k, s in enumerate(raw) if s[2] >= 0.5)
@@ -84,13 +105,15 @@ class MeetDrop:
         self.q_shift = float(rng.normal(0, 8))
         self.severity = severity  # < 1 pulls every value toward clean (loop seams use a light one)
         self.lead_freeze = lead_freeze
-        self.t = np.array([s[0] for s in raw]) * self.stretch
+        self.t = np.array([s[0] for s in raw]) * self.stretch + (self.intro_end if self.intro else 0.0)
         self.h = np.array([s[1] / 360 for s in raw])
         self.fps = np.array([s[2] for s in raw])
         self.q = np.array([s[3] if s[3] is not None else np.nan for s in raw])
         self.dur = float(self.t[-1])
         frozen = self.fps < 0.5
-        if frozen.any():
+        if self.intro:
+            self.swap_at = (self.px_end + self.intro_end) / 2  # inside the second spike
+        elif frozen.any():
             # Swap the source just inside the first freeze: the picture stalls and comes back as the
             # other one. at() reports a freeze from sample k's time on, so t[k-1] is where it starts.
             k = int(np.argmax(frozen))
@@ -109,6 +132,10 @@ class MeetDrop:
         _, rh, rfps, rq = rest
         if t >= self.dur:
             return rest
+        if self.intro and t < self.intro_end:
+            if t < self.spike1_end or t >= self.px_end:
+                return True, rh, 0.0, rq  # the two lag spikes
+            return False, self.mb_hr, 8.0, max(rq, 180.0)  # sudden macroblocks, choppy
         if t < self.lead_freeze:
             return True, rh, 0.0, rq  # the seam freeze happens whatever the severity
         k = min(int(np.searchsorted(self.t, t)), len(self.t) - 1)
@@ -117,7 +144,20 @@ class MeetDrop:
         q = self.q[k] if not np.isnan(self.q[k]) else CLEAN_Q
         q, h, fps = max(q + self.q_shift, rq), min(self.h[k], rh), min(max(self.fps[k], 4.0), rfps)
         ease = min(1.0, max(0.0, (self.dur - t) / TAIL_SECS)) * self.severity
-        return (False, rh - (rh - h) * ease, rfps - (rfps - fps) * ease, rq + (q - rq) * ease)
+        h = rh - (rh - h) * ease
+        if self.intro:
+            h = min(h, self._macroblock_h(t))
+        return (False, h, rfps - (rfps - fps) * ease, rq + (q - rq) * ease)
+
+    def _macroblock_h(self, t: float) -> float:
+        """After the intro the new picture holds full pixelation, then sharpens in discrete
+        resolution steps (geometric, so the coarse end lasts long enough to hide the cut)."""
+        since = t - self.intro_end - MACROBLOCK_HOLD
+        if since < 0:
+            return self.mb_hr
+        k = min(1.0, since / MACROBLOCK_RAMP)
+        k = np.floor(k * MACROBLOCK_STEPS) / MACROBLOCK_STEPS
+        return float(self.mb_hr * (1.0 / self.mb_hr) ** k)
 
 
 class Degrader:
@@ -151,8 +191,8 @@ class Degrader:
             return self._held
         # Uneven frame gaps, as decoded frames arrive with network jitter.
         self._next_t = t + float(self.rng.uniform(0.7, 1.3)) / fps
-        ew = max(64, int(self.w * hr) // 2 * 2)
-        eh = max(48, int(self.h * hr) // 2 * 2)
+        ew = max(16, int(self.w * hr) // 2 * 2)
+        eh = max(12, int(self.h * hr) // 2 * 2)
         vq = vpx_q(q)
         if self._key is None or self._was_frozen or (ew, eh) != self._key[:2] or abs(vq - self._key[2]) >= 3:
             # A new encoder starts on a keyframe. Real Meet also sends one after a freeze, and
@@ -165,8 +205,9 @@ class Degrader:
         self._pts += 1
         for pkt in self._enc.encode(f):
             for d in self._dec.decode(pkt):
+                # Tiny encodes are blown up as hard macroblocks; normal ones get a player's blur.
                 self._held = d.reformat(width=self.w, height=self.h, format="bgr24",
-                                        interpolation="BILINEAR").to_ndarray()
+                                        interpolation="POINT" if hr < NEAREST_BELOW else "BILINEAR").to_ndarray()
         return self._held if self._held is not None else img
 
     def _open(self, w: int, h: int, vq: int) -> None:
