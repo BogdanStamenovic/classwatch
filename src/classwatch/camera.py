@@ -1,23 +1,25 @@
 """Fake webcam: a PipeWire virtual camera that plays a prerecorded clip of Bogdan.
 
-When Bogdan takes over (presses T), the fake link collapses: frames turn blocky,
-the picture updates a few times a second and freezes now and then, and while it
-looks broken the webcam silently replaces the clip; the link then recovers
-slowly. Pressing T again does the reverse and goes back to the clip. The link
-also dips briefly at every loop seam, so the jump cut reads as a network hiccup.
+Switching sources (T, Ctrl+D, Ctrl+P) plays a Meet connection drop replayed from a
+measured trace (classwatch.degrade): the picture freezes, the source swaps inside
+that freeze (0.25-0.6 s after the request), then the picture comes back soft and
+smeared through a real VP9 encoder and climbs back over 10-25 s. Loop seams get a
+short freeze over the wrap and a few seconds of mild smear. By default the camera
+always runs at a mediocre baseline (a little soft, an occasional stutter), so a
+drop never stands out against a perfect picture.
 
 `record` (Ctrl+P in Meet) swaps to the webcam the same way, records RECORD_SECS of
 it as the new clip while the call keeps showing the live webcam, then swaps back
 to the clip. The recorder taps the frames the live feed already reads: only one
 process can stream /dev/video0, so a second ffmpeg would fight the call for it.
 
-Lag is faked by showing fewer distinct frames, never by delaying them: sources
-run in real time and only their newest frame is kept, so nothing plays in slow
-motion (sleeping in the frame loop did exactly that to the webcam).
+Lag is shown by holding frames, never by delaying them: sources run in real time
+and only their newest frame is kept, so nothing plays in slow motion (sleeping in
+the frame loop did exactly that to the webcam).
 
 Architecture (no kernel module, no sudo):
   ClipSource (PyAV, real-time) or WebcamSource (ffmpeg v4l2)  -> newest frame
-      ── CameraStream: steady 30 Hz, Link quality q decides fps/blocks/freezes
+      ── CameraStream: steady 30 Hz; Degrader (VP9 at the drop's or baseline's quality)
       ── rawvideo pipe (fd 0) ──▶ gst-launch-1.0
       ──▶ pipewiresink mode=provide ──▶ PipeWire node "classwatch"
 
@@ -46,16 +48,15 @@ import time
 import av
 import numpy as np
 
+from .degrade import CLEAN, Baseline, Degrader, MeetDrop
+
 STATE_DIR = pathlib.Path(os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local/state")) / "classwatch"
 CLIP_FILE = pathlib.Path(os.environ.get("CLASSWATCH_CAM_CLIP", STATE_DIR / "clip.mp4"))
 RES = (640, 480)
 FPS = 30
-RECOVER_SECS = 20.0  # takeover: webcam quality climbs back to clean over this long
-LAG_SECS = 6.0  # takeover: how long the bad-connection phase lasts before the swap
-RESTORE_LAG_SECS = 3.0  # back to the clip: bad link this long before the swap
-RESTORE_RECOVER_SECS = 6.0
-SEAM_LEAD_SECS = 0.5  # loop seam: the link starts dipping this long before the clip wraps
-SEAM_RECOVER_SECS = 1.6
+SEAM_LEAD_SECS = 0.3  # loop seam: the freeze starts this long before the clip wraps
+SEAM_FREEZE_SECS = 0.7  # ...and lasts this long, so it covers the wrap
+BASELINE = os.environ.get("CLASSWATCH_CAM_BASELINE", "1") != "0"
 RECORD_SECS = 60.0
 CAM_NAME = "classwatch"
 STREAM_PROPS = "props,media.class=Video/Source,media.role=Camera,node.description=classwatch"
@@ -104,70 +105,6 @@ def grant_portal_camera(app_id: str = PORTAL_APP_ID) -> str:
     if r.returncode != 0:
         return f"could not grant ({r.stderr.strip() or r.returncode})"
     return "granted"
-
-
-class Link:
-    """Fake network quality q in [0, 1] (1 = clean), made of overlapping dips.
-
-    A dip holds q at 1 - depth for `hold` seconds, then recovers linearly over
-    `recover` seconds. The lowest active dip wins, so a takeover dip is not
-    shortened by a loop-seam dip that happens to start inside it.
-    """
-
-    def __init__(self) -> None:
-        self._dips: list[tuple[float, float, float, float]] = []
-        self._was_dipped = False
-
-    def dip(self, now: float, depth: float, hold: float, recover: float) -> None:
-        self._dips.append((now, depth, hold, recover))
-
-    def q(self, now: float) -> float:
-        q = 1.0
-        live = []
-        for start, depth, hold, recover in self._dips:
-            t = now - start
-            if t < 0:
-                live.append((start, depth, hold, recover))
-                continue
-            if t < hold:
-                v = 1.0 - depth
-            elif t < hold + recover:
-                v = 1.0 - depth * (1.0 - (t - hold) / recover)
-            else:
-                continue
-            live.append((start, depth, hold, recover))
-            q = min(q, v)
-        self._dips = live
-        return q
-
-    def recovered(self, now: float) -> bool:
-        """True exactly once each time the link returns to clean after a dip."""
-        q = self.q(now)
-        if q < 1.0:
-            self._was_dipped = True
-            return False
-        if self._was_dipped:
-            self._was_dipped = False
-            return True
-        return False
-
-
-def out_fps(q: float) -> float:
-    """Distinct frames per second shown at quality q: 4 when awful, 30 when clean."""
-    return 4.0 + (FPS - 4.0) * max(0.0, min(1.0, q))
-
-
-def render(img: np.ndarray, q: float, rng: np.random.Generator | None = None) -> np.ndarray:
-    """Make a frame look like it went through a link of quality q (blocks + noise)."""
-    if q >= 0.97:
-        return img
-    rng = rng or np.random.default_rng()
-    block = round(1 + (1.0 - q) * 9)
-    h, w = img.shape[:2]
-    small = img[::block, ::block, :].astype(np.float32)
-    out = np.repeat(np.repeat(small, block, axis=0), block, axis=1)[:h, :w]
-    noise = (rng.random((h, w, 1), dtype=np.float32) - 0.5) * (24.0 * (1.0 - q))
-    return np.clip(out + noise, 0, 255).astype(np.uint8)
 
 
 class _Source:
@@ -278,16 +215,17 @@ class WebcamSource(_Source):
 class CameraStream:
     """Feeds the PipeWire camera node at a steady 30 Hz from the current source.
 
-    Modes: clip (the prerecorded loop), degrade (takeover: link collapses, then
-    the webcam), real (the webcam), restore (link collapses, then back to the clip).
-    A recording runs alongside "real" and ends with a restore.
+    Modes: clip (the prerecorded loop), degrade (a drop has started, the webcam
+    swaps in during its freeze), real (the webcam), restore (a drop, then back to
+    the clip). A recording runs alongside "real" and ends with a restore.
     """
 
-    def __init__(self, real_device: str = "/dev/video0"):
+    def __init__(self, real_device: str = "/dev/video0", baseline: bool = BASELINE):
         self.real_device = real_device
         self.mode = "clip"
         self.clip_path: pathlib.Path | None = None
-        self.link = Link()
+        self._drop: MeetDrop | None = None
+        self._drop_t0 = 0.0
         self._source: _Source | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -295,6 +233,8 @@ class CameraStream:
         self._pipe_fd = -1
         self._feeder: subprocess.Popen | None = None
         self._rng = np.random.default_rng()
+        self._baseline = Baseline(self._rng) if baseline else None
+        self._degrader = Degrader(*RES, rng=self._rng)
         self._record_pending: float | None = None  # seconds to record once the webcam is live
         self._record_cancel: threading.Event | None = None  # set while a recording runs
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -318,17 +258,17 @@ class CameraStream:
             log(f"camera: no clip at {clip_path}, using real webcam {self.real_device}")
 
     def degrade(self) -> None:
-        """Takeover: the link collapses for LAG_SECS, the webcam replaces the clip, then recovers."""
+        """A drop starts; the webcam replaces the clip inside its first freeze."""
         if self.mode in ("degrade", "real"):
             return
-        now = time.monotonic()
-        self.link.dip(now, depth=0.9, hold=LAG_SECS + 1.0, recover=RECOVER_SECS)
+        drop = self._start_drop(MeetDrop(self._rng))
         self.mode = "degrade"
-        log("camera: DEGRADE (link collapses, swapping to the real cam)")
-        self._later(LAG_SECS, self._swap_to_real)
+        log(f"camera: DEGRADE ({drop.name}), webcam swaps in at {drop.swap_at:.2f}s, "
+            f"back to normal in {drop.dur:.0f}s")
+        self._later(drop.swap_at, self._swap_to_real)
 
     def restore(self) -> None:
-        """Back to the clip: the link collapses again so the cut is hidden, then recovers.
+        """Back to the clip: a drop starts and the clip swaps in inside its first freeze.
 
         Cancels a recording in progress (the old clip stays): going back to the clip
         stops the webcam, so the recording would only freeze on its last frame.
@@ -339,11 +279,10 @@ class CameraStream:
             log("camera: recording cancelled, keeping the old clip")
         if self.mode in ("clip", "restore") or not self.clip_path:
             return
-        now = time.monotonic()
-        self.link.dip(now, depth=0.85, hold=RESTORE_LAG_SECS + 0.8, recover=RESTORE_RECOVER_SECS)
+        drop = self._start_drop(MeetDrop(self._rng))
         self.mode = "restore"
-        log("camera: RESTORE (link collapses, swapping back to the clip)")
-        self._later(RESTORE_LAG_SECS, self._swap_to_clip)
+        log(f"camera: RESTORE ({drop.name}), clip swaps in at {drop.swap_at:.2f}s")
+        self._later(drop.swap_at, self._swap_to_clip)
 
     def record(self, secs: float = RECORD_SECS) -> None:
         """Record `secs` of webcam as the new clip, then go back to the clip.
@@ -398,8 +337,14 @@ class CameraStream:
 
     def _on_seam(self) -> None:
         if self.mode == "clip":
-            self.link.dip(time.monotonic(), depth=0.6,
-                          hold=SEAM_LEAD_SECS + 0.4, recover=SEAM_RECOVER_SECS)
+            # Replaces a drop still recovering: the freeze over the wrap matters more.
+            self._start_drop(MeetDrop(self._rng, "loss-burst", severity=0.45, max_secs=4.0,
+                                      lead_freeze=SEAM_FREEZE_SECS))
+
+    def _start_drop(self, drop: MeetDrop) -> MeetDrop:
+        with self._lock:
+            self._drop, self._drop_t0 = drop, time.monotonic()
+        return drop
 
     def _use(self, src: _Source) -> None:
         src.start()
@@ -419,7 +364,7 @@ class CameraStream:
             return
         self._use(WebcamSource(self.real_device))
         self.mode = "real"
-        log("camera: switched to REAL webcam, link recovering")
+        log("camera: switched to REAL webcam")
         if self._record_pending is not None:
             self._start_recording(self._record_pending)
 
@@ -428,7 +373,7 @@ class CameraStream:
             return
         self._use(self._clip_source())
         self.mode = "clip"
-        log("camera: switched back to the CLIP, link recovering")
+        log("camera: switched back to the CLIP")
 
     # ---- recording ------------------------------------------------------------
 
@@ -497,28 +442,32 @@ class CameraStream:
     # ---- output -------------------------------------------------------------
 
     def _run(self) -> None:
-        """Steady 30 Hz to gst; the link decides how often the shown frame changes."""
+        """Steady 30 Hz to gst. The degrader decides what each tick shows: the newest source
+        frame through the codec at the current drop's (or the baseline's) quality, or a held
+        frame while the picture is frozen or between the drop's sparser frames."""
         tick = 1.0 / FPS
         next_t = time.monotonic()
         shown: np.ndarray | None = None
-        next_change = 0.0
-        frozen_until = 0.0
         while not self._stop.is_set():
             now = time.monotonic()
-            q = self.link.q(now)
-            if self.link.recovered(now):
-                log("camera: link fully recovered")
-            if q < 0.3 and now >= frozen_until and self._rng.random() < 0.01:
-                frozen_until = now + float(self._rng.uniform(0.3, 1.2))  # a lag spike
-            # Half a tick of slack: deadlines computed from a jittery `now` otherwise miss
-            # every other 30 Hz tick, and a clean clip judders at ~18 fps.
-            if now + tick / 2 >= next_change and now >= frozen_until:
-                with self._lock:
-                    src = self._source
-                img = src.latest() if src else None
-                if img is not None:
-                    shown = render(img, q, self._rng)
-                    next_change = max(next_change + 1.0 / out_fps(q), now - tick)
+            with self._lock:
+                src, drop, t0 = self._source, self._drop, self._drop_t0
+            img = src.latest() if src else None
+            if img is not None:
+                rest = self._baseline.at(now) if self._baseline else CLEAN
+                if drop is not None and now - t0 >= drop.dur:
+                    with self._lock:
+                        if self._drop is drop:
+                            self._drop = None
+                    log("camera: drop over")
+                    drop = None
+                state = drop.at(now - t0, rest) if drop is not None else rest
+                try:
+                    shown = self._degrader.frame(img, now, state)
+                except Exception as e:  # a codec hiccup must not take the camera down
+                    log(f"camera: degrader failed ({e!r}); showing the clean frame")
+                    self._degrader.reset()
+                    shown = img
             if shown is not None:
                 self._write_frame(shown.tobytes())
             next_t += tick
@@ -575,7 +524,8 @@ class CameraStream:
         log("camera: gst feeder started (PipeWire node 'classwatch')")
 
 
-def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") -> int:
+def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0",
+               baseline: bool = BASELINE) -> int:
     """Manage the fake camera: up / down / degrade / restore / record."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if action == "up":
@@ -592,7 +542,7 @@ def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") 
         # explicitly because a shell starting us in the background leaves it ignored.
         signal.signal(signal.SIGINT, signal.default_int_handler)
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-        cam = CameraStream(real_device=real)
+        cam = CameraStream(real_device=real, baseline=baseline)
         try:
             cam.start(clip)
         except Exception as e:

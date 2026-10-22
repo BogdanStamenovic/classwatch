@@ -528,6 +528,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("action", choices=["up", "down", "degrade", "restore", "record"])
     c.add_argument("--clip", help="path to the prerecorded clip (default: state dir clip.mp4)")
     c.add_argument("--real", default="/dev/video0", help="real webcam device")
+    c.add_argument("--no-baseline", action="store_true",
+                   help="clean picture between drops instead of a permanently mediocre link")
     a = sub.add_parser("audio", help="create or remove the virtual Meet output sink")
     a.add_argument("action", choices=["up", "down"])
     m = sub.add_parser("meet", help="open a Meet link as its own Chrome app window")
@@ -546,7 +548,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "camera":
             from .camera import cmd_camera
-            return cmd_camera(args.action, clip=args.clip, real=args.real)
+            return cmd_camera(args.action, clip=args.clip, real=args.real,
+                              baseline=not args.no_baseline)
         if args.cmd == "meet":
             return cmd_meet(args.url, force=args.force)
         if args.cmd == "status":

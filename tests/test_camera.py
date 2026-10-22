@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 import classwatch.camera as cam
-from classwatch.camera import FPS, RES, ClipSource, Link, _Source, out_fps, render
+from classwatch.camera import FPS, RES, ClipSource, _Source
 
 
 def make_clip(path: pathlib.Path, frames: int = 30) -> None:
@@ -31,51 +31,6 @@ def make_clip(path: pathlib.Path, frames: int = 30) -> None:
 @pytest.fixture(autouse=True)
 def _state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(cam, "STATE_DIR", tmp_path)
-
-
-# ---- link quality -------------------------------------------------------------
-
-def test_link_dip_holds_then_recovers_linearly():
-    link = Link()
-    link.dip(100.0, depth=0.8, hold=2.0, recover=4.0)
-    assert link.q(99.0) == 1.0
-    assert link.q(101.0) == pytest.approx(0.2)
-    assert link.q(104.0) == pytest.approx(0.6)  # halfway through recovery
-    assert link.q(106.5) == 1.0
-
-
-def test_link_deepest_dip_wins():
-    link = Link()
-    link.dip(0.0, depth=0.9, hold=10.0, recover=5.0)  # takeover
-    link.dip(1.0, depth=0.3, hold=0.5, recover=0.5)  # a seam inside it
-    assert link.q(1.2) == pytest.approx(0.1)
-
-
-def test_link_reports_recovery_once_per_dip():
-    link = Link()
-    link.dip(0.0, depth=0.5, hold=1.0, recover=1.0)
-    hits = [link.recovered(t / 10) for t in range(60)]
-    assert sum(hits) == 1
-    link.dip(10.0, depth=0.5, hold=1.0, recover=1.0)
-    assert sum(link.recovered(10.0 + t / 10) for t in range(60)) == 1
-
-
-def test_out_fps_range():
-    assert out_fps(1.0) == FPS
-    assert out_fps(0.0) == 4.0
-    assert out_fps(0.0) < out_fps(0.5) < out_fps(1.0)
-
-
-def test_render_clean_is_untouched_and_bad_is_blocky():
-    img = (np.random.rand(RES[1], RES[0], 3) * 255).astype(np.uint8)
-    assert render(img, 1.0) is img
-    out = render(img, 0.1, np.random.default_rng(0))
-    assert out.shape == img.shape and out.dtype == np.uint8
-    block = round(1 + 0.9 * 9)
-    # inside one block every pixel came from the same source pixel (plus noise of +-~11)
-    a = out[:block, :block, 0].astype(int)
-    assert a.max() - a.min() <= 24
-    assert np.abs(out.astype(int) - img.astype(int)).mean() > 20
 
 
 # ---- sources ------------------------------------------------------------------
@@ -131,8 +86,6 @@ def test_slow_consumer_gets_newest_frame_not_a_backlog():
 def test_degrade_then_restore_round_trip(tmp_path, monkeypatch):
     clip = tmp_path / "clip.mp4"
     make_clip(clip)
-    monkeypatch.setattr(cam, "LAG_SECS", 0.3)
-    monkeypatch.setattr(cam, "RESTORE_LAG_SECS", 0.3)
     monkeypatch.setattr(cam, "WebcamSource", lambda dev: ClipSource(clip))  # no webcam in tests
     monkeypatch.setattr(cam, "gst_available", lambda: True)
     monkeypatch.setattr(cam.CameraStream, "_write_frame", lambda self, frame: None)
@@ -142,12 +95,11 @@ def test_degrade_then_restore_round_trip(tmp_path, monkeypatch):
         assert stream.mode == "clip"
         stream.degrade()
         assert stream.mode == "degrade"
-        assert stream.link.q(time.monotonic()) < 0.2
-        time.sleep(0.6)
+        time.sleep(1.0)  # the swap lands inside the drop's first freeze, at most ~0.6 s in
         assert stream.mode == "real"
         stream.restore()
         assert stream.mode == "restore"
-        time.sleep(0.6)
+        time.sleep(1.0)
         assert stream.mode == "clip"
     finally:
         stream.stop()
@@ -173,8 +125,6 @@ def test_portal_grant_present():
 # ---- recording ------------------------------------------------------------------
 
 def _fast_stream(tmp_path, monkeypatch, webcam_clip):
-    monkeypatch.setattr(cam, "LAG_SECS", 0.3)
-    monkeypatch.setattr(cam, "RESTORE_LAG_SECS", 0.3)
     monkeypatch.setattr(cam, "WebcamSource", lambda dev: ClipSource(webcam_clip))
     monkeypatch.setattr(cam, "gst_available", lambda: True)
     monkeypatch.setattr(cam.CameraStream, "_write_frame", lambda self, frame: None)
@@ -221,7 +171,7 @@ def test_record_while_real_starts_at_once(tmp_path, monkeypatch):
     try:
         stream.start(str(clip))
         stream.degrade()
-        time.sleep(0.6)
+        time.sleep(1.0)
         assert stream.mode == "real"
         stream.record(secs=0.5)
         assert stream.mode == "real"
@@ -241,9 +191,9 @@ def test_restore_during_recording_cancels_and_keeps_old_clip(tmp_path, monkeypat
     try:
         stream.start(str(clip))
         stream.record(secs=5.0)
-        time.sleep(0.8)  # swapped to the webcam, recording
+        time.sleep(1.2)  # swapped to the webcam, recording
         stream.restore()  # Ctrl+D closing the mic
-        time.sleep(0.8)
+        time.sleep(1.0)
         assert stream.mode == "clip"
     finally:
         stream.stop()
@@ -261,10 +211,57 @@ def test_record_during_restore_lag_stays_on_webcam(tmp_path, monkeypatch):
     try:
         stream.start(str(clip))
         stream.degrade()
-        time.sleep(0.6)
+        time.sleep(1.0)
         stream.restore()
         stream.record(secs=2.0)
-        time.sleep(0.6)  # past the restore swap, which must have been called off
+        time.sleep(1.0)  # past the restore swap, which must have been called off
         assert stream.mode == "real"
     finally:
         stream.stop()
+
+
+# ---- measured drops ------------------------------------------------------------
+
+def test_every_switch_swaps_early_inside_a_freeze():
+    from classwatch.degrade import SWITCH_SCENARIOS, MeetDrop
+    for seed in range(20):
+        for name in SWITCH_SCENARIOS:
+            d = MeetDrop(np.random.default_rng(seed), name)
+            assert d.swap_at <= 0.8, (name, seed, d.swap_at)
+            assert d.at(d.swap_at)[0], f"{name} seed {seed}: swap not hidden by a freeze"
+
+
+def test_drop_never_beats_the_rest_state_and_returns_to_it():
+    from classwatch.degrade import Baseline, MeetDrop
+    b = Baseline(np.random.default_rng(0))
+    for name in ("sudden-drop", "squeeze", "congestion"):
+        d = MeetDrop(np.random.default_rng(1), name)
+        for k in range(0, int(d.dur * 10)):
+            rest = b.at(k / 10)
+            frozen, h, fps, q = d.at(k / 10, rest)
+            if not frozen:
+                assert h <= rest[1] + 1e-9 and fps <= rest[2] + 1e-9 and q >= rest[3] - 1e-9
+        assert d.at(d.dur + 0.1, rest) == rest
+
+
+def test_seam_freeze_covers_the_wrap_even_when_mild():
+    from classwatch.degrade import MeetDrop
+    d = MeetDrop(np.random.default_rng(3), "loss-burst", severity=0.45, max_secs=4.0,
+                 lead_freeze=cam.SEAM_FREEZE_SECS)
+    assert all(d.at(t)[0] for t in np.arange(0, cam.SEAM_LEAD_SECS + 0.2, 0.05))
+    assert not any(d.at(t)[0] for t in np.arange(cam.SEAM_FREEZE_SECS + 0.05, d.dur, 0.05))
+    assert d.dur <= 5
+
+
+def test_degrader_holds_while_frozen_and_softens_otherwise():
+    from classwatch.degrade import CLEAN, Degrader
+    rng = np.random.default_rng(0)
+    img = (rng.random((RES[1], RES[0], 3)) * 255).astype(np.uint8)
+    deg = Degrader(*RES, rng=rng)
+    assert deg.frame(img, 0.0, CLEAN) is img  # clean passes straight through, no codec
+    bad = deg.frame(img, 0.1, (False, 0.75, 30.0, 210))
+    assert bad.shape == img.shape and bad.dtype == np.uint8
+    # Noise is the worst case for a starved codec: most of it must be gone.
+    assert np.abs(np.diff(bad.astype(int), axis=1)).mean() < 0.5 * np.abs(np.diff(img.astype(int), axis=1)).mean()
+    other = (rng.random(img.shape) * 255).astype(np.uint8)
+    assert deg.frame(other, 0.2, (True, 0.75, 0.0, 210)) is bad  # frozen: the last frame stays

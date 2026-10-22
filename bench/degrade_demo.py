@@ -279,7 +279,7 @@ def meet_style(scenario: str, seed: int):
     deg = Degrader(W, H, np.random.default_rng(seed + 1))
 
     def fn(t, i, src, st):
-        return deg.frame(src(i), t, drop) if t < drop.dur else src(i)
+        return deg.frame(src(i), t, drop.at(t)) if t < drop.dur else src(i)
     return (f"M-{scenario}", f"real Meet trace '{scenario}', {drop.dur:.1f} s, swap at {drop.swap_at:.1f} s",
             drop.dur, drop.swap_at, fn)
 
