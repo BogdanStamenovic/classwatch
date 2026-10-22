@@ -3,3 +3,5 @@ __pycache__/
 *.egg-info/
 # Recordings of his voice (real and cloned) stay local.
 *.wav
+degrade-demos/
+bench/vendor/
