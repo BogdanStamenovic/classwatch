@@ -6,6 +6,11 @@ looks broken the webcam silently replaces the clip; the link then recovers
 slowly. Pressing T again does the reverse and goes back to the clip. The link
 also dips briefly at every loop seam, so the jump cut reads as a network hiccup.
 
+`record` (Ctrl+P in Meet) swaps to the webcam the same way, records RECORD_SECS of
+it as the new clip while the call keeps showing the live webcam, then swaps back
+to the clip. The recorder taps the frames the live feed already reads: only one
+process can stream /dev/video0, so a second ffmpeg would fight the call for it.
+
 Lag is faked by showing fewer distinct frames, never by delaying them: sources
 run in real time and only their newest frame is kept, so nothing plays in slow
 motion (sleeping in the frame loop did exactly that to the webcam).
@@ -51,6 +56,7 @@ RESTORE_LAG_SECS = 3.0  # back to the clip: bad link this long before the swap
 RESTORE_RECOVER_SECS = 6.0
 SEAM_LEAD_SECS = 0.5  # loop seam: the link starts dipping this long before the clip wraps
 SEAM_RECOVER_SECS = 1.6
+RECORD_SECS = 60.0
 CAM_NAME = "classwatch"
 STREAM_PROPS = "props,media.class=Video/Source,media.role=Camera,node.description=classwatch"
 CONTROL_FILE = STATE_DIR / "cam-control"
@@ -274,6 +280,7 @@ class CameraStream:
 
     Modes: clip (the prerecorded loop), degrade (takeover: link collapses, then
     the webcam), real (the webcam), restore (link collapses, then back to the clip).
+    A recording runs alongside "real" and ends with a restore.
     """
 
     def __init__(self, real_device: str = "/dev/video0"):
@@ -288,6 +295,8 @@ class CameraStream:
         self._pipe_fd = -1
         self._feeder: subprocess.Popen | None = None
         self._rng = np.random.default_rng()
+        self._record_pending: float | None = None  # seconds to record once the webcam is live
+        self._record_cancel: threading.Event | None = None  # set while a recording runs
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -319,7 +328,15 @@ class CameraStream:
         self._later(LAG_SECS, self._swap_to_real)
 
     def restore(self) -> None:
-        """Back to the clip: the link collapses again so the cut is hidden, then recovers."""
+        """Back to the clip: the link collapses again so the cut is hidden, then recovers.
+
+        Cancels a recording in progress (the old clip stays): going back to the clip
+        stops the webcam, so the recording would only freeze on its last frame.
+        """
+        self._record_pending = None
+        if self._record_cancel and not self._record_cancel.is_set():
+            self._record_cancel.set()
+            log("camera: recording cancelled, keeping the old clip")
         if self.mode in ("clip", "restore") or not self.clip_path:
             return
         now = time.monotonic()
@@ -328,8 +345,29 @@ class CameraStream:
         log("camera: RESTORE (link collapses, swapping back to the clip)")
         self._later(RESTORE_LAG_SECS, self._swap_to_clip)
 
+    def record(self, secs: float = RECORD_SECS) -> None:
+        """Record `secs` of webcam as the new clip, then go back to the clip.
+
+        From the clip this first degrades like a takeover; the call shows the live
+        webcam for the whole recording.
+        """
+        if self._record_cancel and not self._record_cancel.is_set():
+            log("camera: already recording, ignoring")
+            return
+        if self.mode == "restore":
+            # Still on the webcam (the swap back has not happened yet): stay there.
+            self.mode = "real"
+            log("camera: swap back to the clip called off for the recording")
+        if self.mode == "real":
+            self._start_recording(secs)
+            return
+        self._record_pending = secs
+        self.degrade()  # no-op if already degrading; _swap_to_real starts the recording
+
     def stop(self) -> None:
         self._stop.set()
+        if self._record_cancel:
+            self._record_cancel.set()
         for t in self._timers:
             t.cancel()
         if self._thread.is_alive() and self._thread is not threading.current_thread():
@@ -382,6 +420,8 @@ class CameraStream:
         self._use(WebcamSource(self.real_device))
         self.mode = "real"
         log("camera: switched to REAL webcam, link recovering")
+        if self._record_pending is not None:
+            self._start_recording(self._record_pending)
 
     def _swap_to_clip(self) -> None:
         if self.mode != "restore" or self._stop.is_set():
@@ -389,6 +429,70 @@ class CameraStream:
         self._use(self._clip_source())
         self.mode = "clip"
         log("camera: switched back to the CLIP, link recovering")
+
+    # ---- recording ------------------------------------------------------------
+
+    def _start_recording(self, secs: float) -> None:
+        self._record_pending = None
+        cancel = threading.Event()
+        self._record_cancel = cancel
+        threading.Thread(target=self._record, args=(secs, cancel), daemon=True).start()
+
+    def _record(self, secs: float, cancel: threading.Event) -> None:
+        """Sample the live source at a steady FPS into a new clip, swap it in, restore.
+
+        Sampled on a clock rather than written per webcam frame: ClipSource paces
+        playback by frame count, so a webcam that delivered 24 fps would otherwise
+        give a clip that plays fast.
+        """
+        target = self.clip_path or CLIP_FILE
+        tmp = target.with_name(target.stem + ".new.mp4")
+        n = round(secs * FPS)
+        log(f"camera: RECORDING {secs:.0f}s of webcam into {target.name}")
+        written = 0
+        try:
+            with av.open(str(tmp), "w") as out:
+                st = out.add_stream("libx264", rate=FPS)
+                st.width, st.height = RES
+                st.pix_fmt = "yuv420p"
+                st.options = {"preset": "veryfast", "crf": "20"}
+                tick = 1.0 / FPS
+                next_t = time.monotonic()
+                while written < n and not cancel.is_set() and not self._stop.is_set():
+                    with self._lock:
+                        src = self._source
+                    img = src.latest() if src else None
+                    if img is not None:  # the webcam's first frame can take a moment
+                        frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+                        frame.pts = written
+                        for p in st.encode(frame):
+                            out.mux(p)
+                        written += 1
+                        if written % (FPS * 15) == 0:
+                            log(f"camera: recording {written // FPS}s / {secs:.0f}s")
+                    next_t += tick
+                    sleep_for = next_t - time.monotonic()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    else:
+                        next_t = time.monotonic()
+                for p in st.encode(None):
+                    out.mux(p)
+        except Exception as e:
+            log(f"camera: recording failed ({e!r}), keeping the old clip")
+            tmp.unlink(missing_ok=True)
+            cancel.set()
+            return
+        if written < n:
+            tmp.unlink(missing_ok=True)
+            return
+        if target.exists():
+            os.replace(target, target.with_name(target.stem + ".prev.mp4"))
+        os.replace(tmp, target)
+        self.clip_path = target
+        cancel.set()
+        log(f"camera: recorded {written} frames; new clip saved (old one kept as {target.stem}.prev.mp4)")
+        self.restore()
 
     # ---- output -------------------------------------------------------------
 
@@ -472,7 +576,7 @@ class CameraStream:
 
 
 def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") -> int:
-    """Manage the fake camera: up / down / degrade / restore."""
+    """Manage the fake camera: up / down / degrade / restore / record."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if action == "up":
         # One camera at a time: two would publish two "classwatch" nodes and race for
@@ -495,7 +599,7 @@ def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") 
             log(f"camera: {e}")
             cam.stop()
             return 1
-        # `classwatch run` asks for degrade (takeover) and restore (back to the clip) here.
+        # `classwatch run` asks for degrade (takeover), restore (back to the clip) and record here.
         try:
             while True:
                 try:
@@ -508,6 +612,8 @@ def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") 
                         cam.degrade()
                     elif cmd == "restore":
                         cam.restore()
+                    elif cmd == "record":
+                        cam.record()
                 time.sleep(0.2)
         except KeyboardInterrupt:
             pass
@@ -522,7 +628,7 @@ def cmd_camera(action: str, clip: str | None = None, real: str = "/dev/video0") 
         subprocess.run(["pkill", "-f", f"client-name={CAM_NAME}-cam"], capture_output=True)
         log("camera: stopped PipeWire camera node")
         return 0
-    if action in ("degrade", "restore"):
+    if action in ("degrade", "restore", "record"):
         CONTROL_FILE.write_text(action)
         log(f"camera: {action} requested")
         return 0

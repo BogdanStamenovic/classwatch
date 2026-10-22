@@ -3,7 +3,7 @@ name = "classwatch"
 version = "0.1.0"
 description = "Listen to an online class and have an answer ready when you are called on"
 requires-python = ">=3.12"
-dependencies = ["faster-whisper", "numpy", "av"]
+dependencies = ["faster-whisper", "numpy", "av", "anthropic"]
 
 [project.scripts]
 classwatch = "classwatch.cli:main"

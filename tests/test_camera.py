@@ -168,3 +168,103 @@ def test_portal_grant_present():
     assert portal_grant_present("({'com.google.Chrome': ['yes'], 'org.gnome.Snapshot': ['yes']}, <byte 0x00>)")
     assert not portal_grant_present("({'org.gnome.Snapshot': ['yes']}, <byte 0x00>)")
     assert not portal_grant_present("({'com.google.Chrome': ['no']}, <byte 0x00>)")
+
+
+# ---- recording ------------------------------------------------------------------
+
+def _fast_stream(tmp_path, monkeypatch, webcam_clip):
+    monkeypatch.setattr(cam, "LAG_SECS", 0.3)
+    monkeypatch.setattr(cam, "RESTORE_LAG_SECS", 0.3)
+    monkeypatch.setattr(cam, "WebcamSource", lambda dev: ClipSource(webcam_clip))
+    monkeypatch.setattr(cam, "gst_available", lambda: True)
+    monkeypatch.setattr(cam.CameraStream, "_write_frame", lambda self, frame: None)
+    return cam.CameraStream()
+
+
+def _frames_and_secs(path):
+    with av.open(str(path)) as c:
+        vs = c.streams.video[0]
+        n = sum(1 for _ in c.decode(video=0))
+        return n, float(vs.duration * vs.time_base)
+
+
+def test_record_from_clip_swaps_records_and_comes_back(tmp_path, monkeypatch):
+    clip, webcam = tmp_path / "clip.mp4", tmp_path / "webcam.mp4"
+    make_clip(clip, frames=30)
+    make_clip(webcam, frames=90)
+    old_bytes = clip.read_bytes()
+    stream = _fast_stream(tmp_path, monkeypatch, webcam)
+    try:
+        stream.start(str(clip))
+        stream.record(secs=1.0)
+        assert stream.mode == "degrade"  # the call sees the link collapse first, as on T
+        deadline = time.monotonic() + 5
+        while stream.mode != "clip" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert stream.mode == "clip"
+    finally:
+        stream.stop()
+    # One second at a steady FPS: the player paces by frame count, so the count is what matters.
+    n, secs = _frames_and_secs(clip)
+    assert n == FPS and secs == pytest.approx(1.0, abs=0.05)
+    assert (tmp_path / "clip.prev.mp4").read_bytes() == old_bytes
+    assert not (tmp_path / "clip.new.mp4").exists()
+    log = (tmp_path / "camera.log").read_text()
+    assert "RECORDING" in log and "new clip saved" in log and "switched back to the CLIP" in log
+
+
+def test_record_while_real_starts_at_once(tmp_path, monkeypatch):
+    clip, webcam = tmp_path / "clip.mp4", tmp_path / "webcam.mp4"
+    make_clip(clip)
+    make_clip(webcam, frames=90)
+    stream = _fast_stream(tmp_path, monkeypatch, webcam)
+    try:
+        stream.start(str(clip))
+        stream.degrade()
+        time.sleep(0.6)
+        assert stream.mode == "real"
+        stream.record(secs=0.5)
+        assert stream.mode == "real"
+        assert stream._record_cancel is not None and not stream._record_cancel.is_set()
+        stream.record(secs=0.5)  # a second Ctrl+P while recording is ignored
+        assert "already recording" in (tmp_path / "camera.log").read_text()
+    finally:
+        stream.stop()
+
+
+def test_restore_during_recording_cancels_and_keeps_old_clip(tmp_path, monkeypatch):
+    clip, webcam = tmp_path / "clip.mp4", tmp_path / "webcam.mp4"
+    make_clip(clip)
+    make_clip(webcam, frames=90)
+    old_bytes = clip.read_bytes()
+    stream = _fast_stream(tmp_path, monkeypatch, webcam)
+    try:
+        stream.start(str(clip))
+        stream.record(secs=5.0)
+        time.sleep(0.8)  # swapped to the webcam, recording
+        stream.restore()  # Ctrl+D closing the mic
+        time.sleep(0.8)
+        assert stream.mode == "clip"
+    finally:
+        stream.stop()
+    assert clip.read_bytes() == old_bytes
+    assert not (tmp_path / "clip.new.mp4").exists()
+    assert not (tmp_path / "clip.prev.mp4").exists()
+    assert "recording cancelled" in (tmp_path / "camera.log").read_text()
+
+
+def test_record_during_restore_lag_stays_on_webcam(tmp_path, monkeypatch):
+    clip, webcam = tmp_path / "clip.mp4", tmp_path / "webcam.mp4"
+    make_clip(clip)
+    make_clip(webcam, frames=90)
+    stream = _fast_stream(tmp_path, monkeypatch, webcam)
+    try:
+        stream.start(str(clip))
+        stream.degrade()
+        time.sleep(0.6)
+        stream.restore()
+        stream.record(secs=2.0)
+        time.sleep(0.6)  # past the restore swap, which must have been called off
+        assert stream.mode == "real"
+    finally:
+        stream.stop()

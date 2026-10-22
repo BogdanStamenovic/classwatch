@@ -3,6 +3,6 @@
   "name": "Classwatch",
   "description": "Edge glow + takeover panel for the classwatch daemon. Controlled over D-Bus (io.github.bogdanstamenovic.Classwatch).",
   "shell-version": ["51"],
-  "version": 1,
+  "version": 3,
   "url": "https://github.com/BogdanStamenovic"
 }

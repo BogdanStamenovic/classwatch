@@ -21,13 +21,25 @@ import numpy as np
 RATE = 16000
 SINK = "classwatch"
 STATE_DIR = pathlib.Path(os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local/state")) / "classwatch"
-KEY_FILE = pathlib.Path.home() / "keys/openrouter"
+KEY_FILE = pathlib.Path.home() / "keys/openrouter"  # Jev only
+CLAUDE_KEY_FILE = pathlib.Path.home() / "keys/claude.txt"
 JEV_MODEL = "typesafe/jev-1.13-20260917"
-FAST_MODEL = "anthropic/claude-haiku-5.5"
-GOOD_MODEL = "anthropic/claude-sonnet-5.5"
+FAST_MODEL = "claude-haiku-5-5"
+GOOD_MODEL = "claude-sonnet-5-5"
+# Thinking off on both: it is latency he would be sitting through. Haiku 5.5 takes
+# "disabled" (at effort high or below); Sonnet 5.5 rejects "disabled" and calls it
+# "between_tools", which no other model accepts.
+ANSWER_PARAMS = {
+    FAST_MODEL: {"thinking": {"type": "disabled"}},
+    GOOD_MODEL: {"thinking": {"type": "between_tools"},
+                 # On a safety decline the API reruns the request on another model in the same call.
+                 "betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"},
+}
 DBUS = ["--dest", "io.github.bogdanstamenovic.Classwatch",
         "--object-path", "/io/github/bogdanstamenovic/Classwatch"]
 IFACE = "io.github.bogdanstamenovic.Classwatch"
+EXT_VERSION = 3  # Ctrl+D / Ctrl+P camera keys need extension 3
+SIGNALS = ("TakeoverPressed", "ReleasePressed", "MicOpened", "MicClosed", "RecordPressed")
 ASR_URL = os.environ.get("CLASSWATCH_ASR", "http://100.72.2.62:8791")
 ASR_TOKEN_FILE = pathlib.Path.home() / ".config/classwatch/asr-token"
 
@@ -66,6 +78,18 @@ def log(msg: str) -> None:
 
 def api_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY") or KEY_FILE.read_text().strip()
+
+
+_claude = None
+
+
+def claude():
+    global _claude
+    if _claude is None:
+        import anthropic
+        _claude = anthropic.Anthropic(
+            api_key=os.environ.get("ANTHROPIC_API_KEY") or CLAUDE_KEY_FILE.read_text().strip(), timeout=60)
+    return _claude
 
 
 def http_json(url: str, payload: dict, timeout: float = 20):
@@ -189,22 +213,17 @@ NAME_RE = re.compile(r"\bbo[gk]\s?da(n|ne)\b|stamenovi", re.I)
 
 
 def stream_answer(model: str, prompt: str, on_text) -> None:
-    payload = {"model": model, "stream": True, "max_tokens": 1000,
-               "messages": [{"role": "user", "content": prompt}],
-               # Sonnet 5.5 rejects reasoning off (400 "mandatory"); low effort is the floor.
-               "reasoning": {"effort": "low"} if "sonnet-5.5" in model else {"enabled": False}}
+    params = ANSWER_PARAMS[model]
+    api = claude().beta.messages if "betas" in params else claude().messages
     out = ""
     try:
-        with http_json("https://openrouter.ai/api/v1/chat/completions", payload, timeout=60) as r:
-            for raw in r:
-                line = raw.decode().strip()
-                if not line.startswith("data: ") or line == "data: [DONE]":
-                    continue
-                d = json.loads(line[6:])
-                c = (d.get("choices") or [{}])[0].get("delta", {}).get("content")
-                if c:
-                    out += c
-                    on_text(out)
+        with api.stream(model=model, max_tokens=1000, output_config={"effort": "low"},
+                        messages=[{"role": "user", "content": prompt}], **params) as stream:
+            for text in stream.text_stream:
+                out += text
+                on_text(out)
+            if stream.get_final_message().stop_reason == "refusal":
+                on_text(out + f"\n[{model} declined to answer]")
     except Exception as e:
         on_text(out + f"\n[{model} failed: {e!r}]")
 
@@ -214,11 +233,14 @@ def stream_answer(model: str, prompt: str, on_text) -> None:
 class Shell:
     def __init__(self, dry: bool = False):
         self.dry = dry
-        self.ok = not dry and self._call("Ping") is not None
+        ping = self._call("Ping")
+        self.ok = not dry and ping is not None
+        m = re.search(r"extension (\d+)", ping or "")
+        self.version = int(m.group(1)) if m else 0
         log(f"shell: extension {'connected' if self.ok else 'NOT available, using notify-send fallback'}")
 
     def watch(self, on_signal) -> None:
-        """Call on_signal(name) for each signal the extension emits (TakeoverPressed, ReleasePressed)."""
+        """Call on_signal(name) for each signal in SIGNALS the extension emits."""
         if not self.ok:
             return
 
@@ -228,7 +250,7 @@ class Shell:
                                      stdout=subprocess.PIPE, text=True)
                 assert p.stdout is not None
                 for line in p.stdout:
-                    m = re.search(rf"{re.escape(IFACE)}\.(\w+Pressed)", line)
+                    m = re.search(rf"{re.escape(IFACE)}\.({'|'.join(SIGNALS)})\b", line)
                     if m:
                         on_signal(m.group(1))
                 p.wait()
@@ -253,6 +275,10 @@ class Shell:
         if self.ok:
             self._call("SetContent", question, answer)
 
+    def camera_keys(self, on: bool) -> None:
+        if self.ok and self.version >= EXT_VERSION:
+            self._call("SetCameraKeys", "true" if on else "false")
+
 
 # ---- main loop ----------------------------------------------------------------
 
@@ -269,12 +295,23 @@ class Run:
         self.answers = {FAST_MODEL: "", GOOD_MODEL: ""}
         self.last_push = 0.0
         self.jobs: queue.Queue = queue.Queue()
+        self.mic_open = False  # Meet's mic, as toggled by Ctrl+D in the Meet window
+        self.taken_over = False
         self.whisper = None
         self.remote_ok = not args.local and ASR_TOKEN_FILE.exists()
         # Load the CPU fallback in the background so a dead archserver costs one chunk, not a load.
         threading.Thread(target=self._load_local, daemon=True).start()
         if self.remote_ok:
             threading.Thread(target=self._warm_remote, daemon=True).start()
+        threading.Thread(target=self._warm_claude, daemon=True).start()
+
+    def _warm_claude(self) -> None:
+        """Import the SDK and open the connection now: cold, the first answer of a class
+        started ~2.4 s late (import 2.4 s, then the TLS handshake). count_tokens is free."""
+        try:
+            claude().messages.count_tokens(model=FAST_MODEL, messages=[{"role": "user", "content": "hi"}])
+        except Exception as e:
+            log(f"claude: warm-up failed ({e!r}); the first answer will pay for the connection")
 
     def _warm_remote(self) -> None:
         """Make archserver load its model now. It unloads after 15 idle minutes, and a cold
@@ -314,12 +351,27 @@ class Run:
         return " ".join(s.text.strip() for s in segs).strip(), "cpu"
 
     def on_key(self, signal_name: str) -> None:
-        """T on a call drives the fake camera: takeover degrades to the webcam, T again goes back."""
+        """Keys drive the fake camera: it shows the webcam while the mic is open or the call
+        is taken over (T), the clip otherwise. Ctrl+P records a new clip.
+
+        Either reason alone keeps the webcam: muting after answering must not cut back
+        to the clip while Meet is still fullscreen, and T handing back must not while
+        the mic is still open.
+        """
         from .camera import cmd_camera
+        log(f"key: {signal_name}")
         if signal_name == "TakeoverPressed":
-            cmd_camera("degrade")
+            self.taken_over = True
         elif signal_name == "ReleasePressed":
-            cmd_camera("restore")
+            self.taken_over = False
+        elif signal_name == "MicOpened":
+            self.mic_open = True
+        elif signal_name == "MicClosed":
+            self.mic_open = False
+        elif signal_name == "RecordPressed":
+            cmd_camera("record")
+            return
+        cmd_camera("degrade" if self.mic_open or self.taken_over else "restore")
 
     def loop(self) -> int:
         chunk, overlap = int(self.args.chunk * RATE), int(0.5 * RATE)
@@ -327,6 +379,10 @@ class Run:
         threading.Thread(target=self.decider, daemon=True).start()
         if self.args.camera:
             self.shell.watch(self.on_key)
+            if self.shell.ok and self.shell.version < EXT_VERSION:
+                log(f"shell: extension {self.shell.version} is loaded, Ctrl+D / Ctrl+P need {EXT_VERSION}: "
+                    "log out and back in")
+            self.shell.camera_keys(True)
         log("run: listening")
         while True:
             pcm, start = self.audio.since(pos)
@@ -435,7 +491,8 @@ def cmd_meet(url: str, force: bool = False) -> int:
 
 def cmd_status() -> int:
     print(f"sink '{SINK}': {'present' if sink_exists() else 'missing (run: classwatch audio up)'}")
-    print(f"openrouter key: {'present' if KEY_FILE.exists() or os.environ.get('OPENROUTER_API_KEY') else 'MISSING'}")
+    print(f"openrouter key (Jev): {'present' if KEY_FILE.exists() or os.environ.get('OPENROUTER_API_KEY') else 'MISSING'}")
+    print(f"claude key (answers): {'present' if CLAUDE_KEY_FILE.exists() or os.environ.get('ANTHROPIC_API_KEY') else 'MISSING'}")
     try:
         with urllib.request.urlopen(f"{ASR_URL}/health", timeout=3) as r:
             print(f"archserver asr: {json.loads(r.read())}")
@@ -466,9 +523,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
     r.add_argument("--drain", type=float, default=8.0, help="seconds to wait for answers after a replay ends")
     r.add_argument("--dry-run", action="store_true", help="no shell extension calls, just log")
-    r.add_argument("--camera", action="store_true", help="T (takeover) makes a running `classwatch camera up` lag and swap to the real cam; T again swaps back to the clip and minimizes Meet (start `camera up` first)")
+    r.add_argument("--camera", action="store_true", help="drive a running `classwatch camera up` (start it first): T (takeover) or Ctrl+D (mic open) in Meet lag and swap to the real cam, until both are off again; Ctrl+P in Meet records a new 60 s clip")
     c = sub.add_parser("camera", help="fake webcam: prerecorded clip, degrades and swaps to the real cam when called on")
-    c.add_argument("action", choices=["up", "down", "degrade", "restore"])
+    c.add_argument("action", choices=["up", "down", "degrade", "restore", "record"])
     c.add_argument("--clip", help="path to the prerecorded clip (default: state dir clip.mp4)")
     c.add_argument("--real", default="/dev/video0", help="real webcam device")
     a = sub.add_parser("audio", help="create or remove the virtual Meet output sink")
@@ -500,7 +557,12 @@ def main(argv: list[str] | None = None) -> int:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         if not args.replay:
             setup_audio()
-        return Run(args).loop()
+        run = Run(args)
+        try:
+            return run.loop()
+        finally:
+            if args.camera:
+                run.shell.camera_keys(False)
     except KeyboardInterrupt:
         return 130
     except Exception as e:

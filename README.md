@@ -18,7 +18,7 @@ Meet (Chrome) ──▶ PipeWire null sink "classwatch" ──loopback──▶ 
                          ▼
    GNOME Shell extension: orange glow, T grabbed ──T──▶ Meet window fullscreen + answer panel
                          ▲
-   Haiku 5.5 + Sonnet 5.5 stream answers in parallel, regenerated for 15 s as the question arrives
+   Haiku 5.5 + Sonnet 5.5 (Claude API, thinking off) stream answers in parallel, regenerated for 15 s as the question arrives
 ```
 
 The extension only draws and grabs the key; everything else is the daemon. It talks to the
@@ -63,7 +63,8 @@ cd ~/data/classwatch && python3 -m venv .venv && .venv/bin/pip install -e .
 ln -sf ~/data/classwatch/.venv/bin/classwatch ~/.local/bin/classwatch
 ```
 
-Needs `~/keys/openrouter` (or `OPENROUTER_API_KEY`) and `~/.config/classwatch/asr-token`
+Needs `~/keys/claude.txt` (or `ANTHROPIC_API_KEY`) for the answers, `~/keys/openrouter` (or
+`OPENROUTER_API_KEY`) for Jev only, and `~/.config/classwatch/asr-token`
 (copied from archserver).
 
 archserver (GPU server):
@@ -100,19 +101,29 @@ classwatch run --camera              # terminal 2
 classwatch camera down               # afterwards
 ```
 
-With `run --camera`, the T key drives the camera:
+With `run --camera`, keys drive the camera. The camera shows the webcam while the mic is open
+**or** the call is taken over, and the clip otherwise:
 
 | Press | What happens |
 |---|---|
 | T while the edge glows | Meet goes fullscreen with the answer panel; the fake link collapses (blocky, ~4-7 fps, short freezes) for 6 s, the webcam silently replaces the clip, then the link recovers over 20 s |
-| T again | Meet is minimized; the link collapses for 3 s, the clip replaces the webcam, then recovers over 6 s |
+| T again | Meet is minimized; unless the mic is open, the link collapses for 3 s, the clip replaces the webcam, then recovers over 6 s |
+| Ctrl+D in Meet | Meet toggles the mic as usual. Opening it swaps to the webcam (same lag as T); closing it swaps back to the clip unless the call is taken over |
+| Ctrl+P in Meet | Swaps to the webcam (same lag), records 60 s of it as the new clip while the call keeps showing you live, then swaps back to the new clip. The old clip is kept as `clip.prev.mp4`. Closing the mic during the recording cancels it |
+
+Ctrl+D and Ctrl+P only do this with the Meet window focused, and only while `run --camera` is
+running; everywhere else they behave normally. The extension has to grab them to see them at
+all (GNOME gives a window's keys to the window before any extension can look), so it resends
+Ctrl+D to Meet itself, 100 ms after you let go. Ctrl+P is kept from Meet so Chrome's print dialog
+does not open over the call. The extension tracks the mic by counting Ctrl+D and assumes it starts
+muted; unmuting with the mouse puts the camera out of step until the next Ctrl+D.
 
 The link also dips for ~2 s around every loop seam (starting 0.5 s before the wrap), so the jump
 cut reads as a network hiccup. Lag is faked by showing fewer distinct frames, never by delaying
 them, so the webcam never plays in slow motion. Measured through the PipeWire node: 30 distinct
 frames/s when clean, about 6 while collapsed.
 
-The GNOME extension changed in version 2 (the T toggle, and keeping the panel visible over a
+The GNOME extension changed in version 3 (Ctrl+D and Ctrl+P) and version 2 (the T toggle, and keeping the panel visible over a
 fullscreen Meet). GNOME on Wayland loads extension code only at login, so log out and back in
 once after updating.
 
@@ -136,6 +147,8 @@ Testing without a class: `classwatch run --replay lesson.wav --dry-run` (16 kHz 
 ## Limitations
 
 - **During a takeover T is grabbed globally**: a `t` typed into Meet's chat hands the call back. Click the panel to hide it without giving up the call.
+- **Ctrl+D reaches Meet 100 ms late**, and a second Ctrl+D within ~0.5 s of the first goes straight to Meet without moving the camera (the keys are briefly ungrabbed while the copy is sent). Copies sent sooner were dropped by GNOME in testing.
+- **Ctrl+P records whatever the webcam sees for the full 60 s**; sit still. There is no preview before it replaces the clip (`clip.prev.mp4` is the undo).
 - **The fake camera is only listed if it runs before Chrome starts**; `classwatch meet` refuses to open while Chrome is running (`--force` overrides).
 - The camera's bitrate drop is faked visually (blocky frames plus delay); Meet re-encodes whatever it receives.
 - **Language is forced to Serbian.** Auto-detection on 4 s chunks sometimes picked English and

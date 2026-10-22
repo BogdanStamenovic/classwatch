@@ -1,0 +1,15 @@
+<html><head><title>Fake Meet - meet.google.com</title></head>
+<body style="background:#336;color:white;font:34px sans-serif">
+<h2>Fake Meet: keys received</h2>
+<div id="log"></div>
+<script>
+// Logs every Ctrl chord that reaches the page, so a screenshot shows whether the
+// extension's resent Ctrl+D (and nothing for Ctrl+P) arrived.
+let n = 0;
+addEventListener('keydown', e => {
+  if (e.key === 'Control' || e.key === 'Alt' || e.key === 'Tab') return;
+  if (e.key === 'p') e.preventDefault();  // a leaked Ctrl+P would otherwise open Chrome's print preview
+  n++;
+  document.getElementById('log').insertAdjacentHTML('beforeend', `<div>${n}: ${e.ctrlKey ? 'ctrl+' : 'plain '}${e.key} (code ${e.code})</div>`);
+});
+</script></body></html>
