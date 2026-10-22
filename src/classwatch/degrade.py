@@ -82,10 +82,12 @@ class MeetDrop:
         raw = TRACES[self.name]
         self.intro = (not lead_freeze) if intro is None else intro
         if self.intro:
+            lag = rng.uniform(0.4, 0.8)
             f1, px, f2 = rng.uniform(0.3, 0.5), rng.uniform(0.4, 0.7), rng.uniform(0.25, 0.4)
-            self.spike1_end = float(f1)
-            self.px_end = float(f1 + px)
-            self.intro_end = float(f1 + px + f2)
+            self.lag_end = float(lag)  # stutter first: still sharp, few new frames
+            self.spike1_end = float(lag + f1)
+            self.px_end = float(lag + f1 + px)
+            self.intro_end = float(lag + f1 + px + f2)
             self.mb_hr = float(rng.uniform(*MACROBLOCK_HR))
             # The scenario's own opening freeze is replaced by the intro; it plays from the first
             # decoded frame after that freeze (stall-5s decodes one sample before it stalls).
@@ -133,6 +135,8 @@ class MeetDrop:
         if t >= self.dur:
             return rest
         if self.intro and t < self.intro_end:
+            if t < self.lag_end:
+                return False, rh, 5.0, rq  # the link starts to struggle: sharp but stuttering
             if t < self.spike1_end or t >= self.px_end:
                 return True, rh, 0.0, rq  # the two lag spikes
             return False, self.mb_hr, 8.0, max(rq, 180.0)  # sudden macroblocks, choppy
