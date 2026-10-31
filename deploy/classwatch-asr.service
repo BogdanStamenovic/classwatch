@@ -2,6 +2,11 @@
 Description=classwatch GPU transcription server (laptop posts audio chunks here)
 After=tailscaled.service
 Requires=classwatch-asr.socket
+# No start rate limit. Each update stops the server and starts one for a /health check, and
+# on 2026-10-31 two updates within 10 s hit the default (5 starts per 10 s), which also fails
+# the socket ("service-start-limit-hit") and closes the port. A crash loop is already slowed
+# by RestartSec, and connections only arrive every 4 s.
+StartLimitIntervalSec=0
 
 [Service]
 # Started by classwatch-asr.socket on the first connection. It exits on its own after

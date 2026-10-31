@@ -142,6 +142,15 @@ check_server() {
   systemctl --user stop classwatch-asr.service 2>/dev/null
 }
 
+# The port must be listening when setup or update ends, whatever happened on the way.
+sock_ok() {
+  systemctl --user is-active -q classwatch-asr.socket && return
+  say "classwatch-asr.socket is $(systemctl --user is-active classwatch-asr.socket); resetting it"
+  systemctl --user reset-failed classwatch-asr.socket classwatch-asr.service 2>/dev/null || true
+  systemctl --user start classwatch-asr.socket
+  systemctl --user is-active -q classwatch-asr.socket || die "classwatch-asr.socket does not start (journalctl --user -u classwatch-asr.socket)"
+}
+
 server_remove() {
   # Only units this checkout installed: a remove of a half-done install must not take down a
   # server that another checkout (a dev clone, the old linked recipe) is still running.
@@ -249,6 +258,7 @@ case "${1:-}" in
       token
       units
       check_server
+      sock_ok
       say "ASR server listening on $ASR_ADDR (socket-activated). Logs: journalctl --user -u classwatch-asr"
     else
       client_deps
