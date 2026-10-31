@@ -122,7 +122,7 @@ units() {
   # A running server keeps the old venv and code. Stopping it is enough: the socket starts the
   # new one on the next request (~0.8 s, plus ~3.3 s to load the model).
   if systemctl --user is-active -q classwatch-asr.service; then
-    systemctl --user stop classwatch-asr.service
+    systemctl --user stop classwatch-asr.service 2>/dev/null
     say "stopped the running server; the socket starts the new one on the next request"
   fi
 }
@@ -138,7 +138,8 @@ check_server() {
   fi
   out=$(curl -sS -m 30 "http://$ASR_ADDR/health") || die "no answer from http://$ASR_ADDR/health (journalctl --user -u classwatch-asr)"
   say "health: $out"
-  systemctl --user stop classwatch-asr.service
+  # stderr: systemd warns that the socket can start it again, which is the point
+  systemctl --user stop classwatch-asr.service 2>/dev/null
 }
 
 server_remove() {
