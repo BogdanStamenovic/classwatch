@@ -79,7 +79,8 @@ the role it used to that file, so a later update or remove acts on the same role
   changed. A running server is stopped and the socket starts the new one on the next request.
 - **remove asks** before deleting `~/.config/classwatch` (token, role) and
   `~/.local/state/classwatch` (logs, clip). Without a TTY it keeps them and says so.
-- The CUDA pip install runs under `systemd-run --user --scope -p MemoryMax=3G`.
+- The CUDA pip install runs under `systemd-run --user --scope -p MemoryMax=3G`, and the server
+  venv takes 2.6 GB (uv hardlinks it from its cache, so a reinstall costs no extra disk).
 - Units are copied rather than linked: `systemctl --user disable` on a linked unit deletes the
   link, after which the socket refuses to start.
 
@@ -87,7 +88,7 @@ Keys the client needs: `~/keys/claude.txt` (or `ANTHROPIC_API_KEY`) for the answ
 `~/keys/openrouter` (or `OPENROUTER_API_KEY`) for Jev. The extension loads at the next login.
 
 Moving a machine from a dev-checkout install (the old manual recipe) to ownbox: on the laptop,
-delete the old `~/.local/bin/classwatch` symlink first, because ownbox refuses to replace a
+delete the `~/.local/bin/classwatch` symlink the old recipe made, because ownbox refuses to replace a
 launcher it did not create. Setup replaces linked units and the extension in place.
 
 Fallback without ownbox: `./install.sh setup` from any clone does the same job, pointing
@@ -100,7 +101,7 @@ libraries in the process (measured 2026-10-31: 7 MB resident, 1.2 GB in swap, wh
 A cold start costs ~0.8 s to answer plus ~3.3 s to load the model, which the laptop's 120 s
 warm-up request covers.
 
-The token is generated once into `~/.config/classwatch/asr-token`; the tailnet is shared with
+Server setup generates the token once into `~/.config/classwatch/asr-token`; the tailnet is shared with
 other people, so the server refuses requests without it.
 
 ## Usage
@@ -183,6 +184,8 @@ Testing without a class: `classwatch run --replay lesson.wav --dry-run` (16 kHz 
   question usually arrives a chunk later, so the answer firms up 4–8 s after the call.
 - **The speaker loopback is pinned to the default output at creation.** Switching to
   headphones mid-class keeps the class on the old output; run `classwatch audio down && classwatch audio up`.
+- **A first server install needs ~2.6 GB free on the disk holding the uv cache.** On 2026-10-31
+  it failed with 1.0 GB free on archserver's root and left the old install untouched.
 - **An update on archserver drops a request in flight**: it stops the running server so the new
   code takes over. Do not update during a class; the laptop falls back to its CPU model meanwhile.
 - **The client role has not been installed on the laptop yet** (as of 2026-10-31). It was run
