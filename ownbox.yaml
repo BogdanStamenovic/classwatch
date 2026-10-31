@@ -1,0 +1,15 @@
+schema: 1
+name: classwatch
+description: Listen to an online class, glow when you are called on, and have the answer ready (GPU ASR server + laptop client)
+homepage: https://github.com/BogdanStamenovic/classwatch
+tags: [whisper, asr, cuda, gnome-extension, pipewire, meet, python, systemd]
+install:
+  platforms: [linux]
+  setup:
+    linux: [./install.sh setup]
+  update:
+    linux: [./install.sh update]
+  remove:
+    linux: [./install.sh remove]
+command:
+  linux: .venv/bin/classwatch

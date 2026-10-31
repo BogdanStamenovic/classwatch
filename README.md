@@ -56,32 +56,49 @@ Answers, 6 class questions, no system prompt, streaming from the laptop:
 
 ## Install
 
-Laptop (client):
+Through ownbox, on both machines (the same command; the role differs):
 
 ```
-cd ~/data/classwatch && python3 -m venv .venv && .venv/bin/pip install -e .
-ln -sf ~/data/classwatch/.venv/bin/classwatch ~/.local/bin/classwatch
+ownbox sync && ownbox install classwatch
 ```
 
-Needs `~/keys/claude.txt` (or `ANTHROPIC_API_KEY`) for the answers, `~/keys/openrouter` (or
-`OPENROUTER_API_KEY`) for Jev only, and `~/.config/classwatch/asr-token`
-(copied from archserver).
+`install.sh` does the whole lifecycle for the machine's role:
 
-archserver (GPU server):
+| Role | Chosen when | setup / update installs | remove undoes |
+|---|---|---|---|
+| server | `nvidia-smi` lists a GPU (archserver) | venv with the CUDA wheels (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12==9.*`), the ASR token if missing, `classwatch-asr.socket` + `.service` copied into `~/.config/systemd/user`, then a `/health` check through the socket | the socket and service units |
+| client | no GPU (the laptop) | venv, the GNOME extension copied into `~/.local/share/gnome-shell/extensions`, the ASR token fetched from archserver over ssh if missing, warnings for missing keys and tools | the extension, the virtual sink, the fake camera; refuses while `classwatch run` is running |
 
-```
-cd ~/data/classwatch && uv venv .venv && uv pip install --python .venv -e . nvidia-cublas-cu12 'nvidia-cudnn-cu12==9.*'
-ln -sf ~/data/classwatch/deploy/classwatch-asr.{socket,service} ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now classwatch-asr.socket
-```
+Override the role with `CLASSWATCH_ROLE=server|client` or `~/.config/classwatch/role`. setup writes
+the role it used to that file, so a later update or remove acts on the same role.
+
+- **update keeps user data**: the token, the role file, `~/keys`, the logs and the camera clip are
+  never rewritten. It only rebuilds the venv and recopies units and the extension, so
+  `ownbox rollback` (which reruns the older revision's update) is safe.
+- **The socket keeps listening through an update**: it is restarted only if its unit file
+  changed. A running server is stopped and the socket starts the new one on the next request.
+- **remove asks** before deleting `~/.config/classwatch` (token, role) and
+  `~/.local/state/classwatch` (logs, clip). Without a TTY it keeps them and says so.
+- The CUDA pip install runs under `systemd-run --user --scope -p MemoryMax=3G`.
+- Units are copied rather than linked: `systemctl --user disable` on a linked unit deletes the
+  link, after which the socket refuses to start.
+
+Keys the client needs: `~/keys/claude.txt` (or `ANTHROPIC_API_KEY`) for the answers and
+`~/keys/openrouter` (or `OPENROUTER_API_KEY`) for Jev. The extension loads at the next login.
+
+Moving a machine from a dev-checkout install (the old manual recipe) to ownbox: on the laptop,
+delete the old `~/.local/bin/classwatch` symlink first, because ownbox refuses to replace a
+launcher it did not create. Setup replaces linked units and the extension in place.
+
+Fallback without ownbox: `./install.sh setup` from any clone does the same job, pointing
+everything at that clone.
 
 The server is socket-activated: systemd holds port 8791 and starts `classwatch-asr` on the
 first connection. After `--idle-unload` seconds (default 900) without a request it unloads the
 model **and exits**, because unloading frees VRAM but leaves ~1.2 GB of CUDA context and
 libraries in the process (measured 2026-10-31: 7 MB resident, 1.2 GB in swap, while idle).
 A cold start costs ~0.8 s to answer plus ~3.3 s to load the model, which the laptop's 120 s
-warm-up request covers. Do not `systemctl --user disable classwatch-asr.service`: the units are
-linked, and disabling a linked unit deletes its symlink, after which the socket refuses to start.
+warm-up request covers.
 
 The token is generated once into `~/.config/classwatch/asr-token`; the tailnet is shared with
 other people, so the server refuses requests without it.
@@ -166,6 +183,10 @@ Testing without a class: `classwatch run --replay lesson.wav --dry-run` (16 kHz 
   question usually arrives a chunk later, so the answer firms up 4–8 s after the call.
 - **The speaker loopback is pinned to the default output at creation.** Switching to
   headphones mid-class keeps the class on the old output; run `classwatch audio down && classwatch audio up`.
+- **An update on archserver drops a request in flight**: it stops the running server so the new
+  code takes over. Do not update during a class; the laptop falls back to its CPU model meanwhile.
+- **The client role has not been installed on the laptop yet** (as of 2026-10-31). It was run
+  only in a throwaway home directory on archserver, with no GNOME session and no audio sink.
 - The extension needs one logout/login after install (GNOME Wayland discovers extensions at login).
 - On the CPU fallback, detection lag grows to ~10 s and transcripts are noticeably worse.
 - Answers come from a noisy transcript and can be wrong; the panel shows both models so a

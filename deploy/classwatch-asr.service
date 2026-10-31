@@ -7,6 +7,7 @@ Requires=classwatch-asr.socket
 # Started by classwatch-asr.socket on the first connection. It exits on its own after
 # --idle-unload seconds without a request, because only exiting returns the ~1.2 GB of CUDA
 # context that unloading the model leaves behind.
-ExecStart=%h/data/classwatch/.venv/bin/classwatch serve-asr
+# @DIR@ is the checkout; install.sh fills it in when it copies this unit into place.
+ExecStart=@DIR@/.venv/bin/classwatch serve-asr
 Restart=on-failure
 RestartSec=5
