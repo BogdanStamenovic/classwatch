@@ -71,9 +71,17 @@ archserver (GPU server):
 
 ```
 cd ~/data/classwatch && uv venv .venv && uv pip install --python .venv -e . nvidia-cublas-cu12 'nvidia-cudnn-cu12==9.*'
-ln -sf ~/data/classwatch/deploy/classwatch-asr.service ~/.config/systemd/user/
-systemctl --user enable --now classwatch-asr
+ln -sf ~/data/classwatch/deploy/classwatch-asr.{socket,service} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now classwatch-asr.socket
 ```
+
+The server is socket-activated: systemd holds port 8791 and starts `classwatch-asr` on the
+first connection. After `--idle-unload` seconds (default 900) without a request it unloads the
+model **and exits**, because unloading frees VRAM but leaves ~1.2 GB of CUDA context and
+libraries in the process (measured 2026-10-31: 7 MB resident, 1.2 GB in swap, while idle).
+A cold start costs ~0.8 s to answer plus ~3.3 s to load the model, which the laptop's 120 s
+warm-up request covers. Do not `systemctl --user disable classwatch-asr.service`: the units are
+linked, and disabling a linked unit deletes its symlink, after which the socket refuses to start.
 
 The token is generated once into `~/.config/classwatch/asr-token`; the tailnet is shared with
 other people, so the server refuses requests without it.

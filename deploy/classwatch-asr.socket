@@ -1,0 +1,10 @@
+[Unit]
+Description=classwatch GPU transcription server socket (starts classwatch-asr on demand)
+
+[Socket]
+# The tailnet address; FreeBind lets this bind before tailscaled has brought the address up.
+ListenStream=100.72.2.62:8791
+FreeBind=true
+
+[Install]
+WantedBy=sockets.target

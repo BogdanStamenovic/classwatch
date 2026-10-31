@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import site
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,8 +36,10 @@ def preload_cuda_libs() -> None:
 
 
 class Model:
-    def __init__(self, name: str, idle_unload: float, language: str | None = "sr"):
+    def __init__(self, name: str, idle_unload: float, language: str | None = "sr",
+                 on_idle=None):
         self.name, self.idle_unload, self.language = name, idle_unload, language
+        self.on_idle = on_idle
         self.model = None
         self.lock = threading.Lock()
         self.last_used = time.time()
@@ -46,9 +49,17 @@ class Model:
         while True:
             time.sleep(30)
             with self.lock:
-                if self.model is not None and time.time() - self.last_used > self.idle_unload:
+                if time.time() - self.last_used <= self.idle_unload:
+                    continue
+                if self.model is not None:
                     self.model = None
                     print(f"unloaded {self.name} after {self.idle_unload:.0f}s idle", flush=True)
+                if self.on_idle is not None:
+                    # Dropping the model frees VRAM but not the ~1.2 GB of CUDA context and
+                    # libraries the process keeps; only exiting returns that. Under socket
+                    # activation systemd starts us again on the next connection.
+                    self.on_idle()
+                    return
 
     def transcribe(self, pcm: np.ndarray) -> str:
         with self.lock:
@@ -63,10 +74,26 @@ class Model:
             return " ".join(s.text.strip() for s in segs).strip()
 
 
+def systemd_socket() -> socket.socket | None:
+    """The listening socket systemd passed us (classwatch-asr.socket), if any."""
+    if os.environ.get("LISTEN_PID") != str(os.getpid()) or os.environ.get("LISTEN_FDS") != "1":
+        return None
+    return socket.socket(fileno=3)
+
+
 def serve(host: str, port: int, model_name: str, idle_unload: float) -> int:
     preload_cuda_libs()
     token = TOKEN_FILE.read_text().strip()
-    model = Model(model_name, idle_unload)
+    inherited = systemd_socket()
+    httpd: list[ThreadingHTTPServer] = []
+
+    def exit_idle() -> None:
+        print(f"exiting after {idle_unload:.0f}s idle; systemd restarts on demand", flush=True)
+        threading.Thread(target=httpd[0].shutdown, daemon=True).start()
+
+    # Only exit when idle if something will start us again; a hand-run server keeps the old
+    # unload-but-stay-up behaviour.
+    model = Model(model_name, idle_unload, on_idle=exit_idle if inherited else None)
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, obj: dict) -> None:
@@ -97,6 +124,15 @@ def serve(host: str, port: int, model_name: str, idle_unload: float) -> int:
         def log_message(self, fmt, *args):
             pass
 
-    print(f"classwatch asr: {model_name} on {host}:{port}", flush=True)
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    if inherited is not None:
+        server = ThreadingHTTPServer(inherited.getsockname()[:2], Handler, bind_and_activate=False)
+        server.socket.close()
+        server.socket = inherited
+        where = "socket from systemd"
+    else:
+        server = ThreadingHTTPServer((host, port), Handler)
+        where = f"{host}:{port}"
+    httpd.append(server)
+    print(f"classwatch asr: {model_name} on {where}", flush=True)
+    server.serve_forever()
     return 0

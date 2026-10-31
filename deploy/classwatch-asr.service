@@ -1,11 +1,12 @@
 [Unit]
 Description=classwatch GPU transcription server (laptop posts audio chunks here)
 After=tailscaled.service
+Requires=classwatch-asr.socket
 
 [Service]
+# Started by classwatch-asr.socket on the first connection. It exits on its own after
+# --idle-unload seconds without a request, because only exiting returns the ~1.2 GB of CUDA
+# context that unloading the model leaves behind.
 ExecStart=%h/data/classwatch/.venv/bin/classwatch serve-asr
 Restart=on-failure
 RestartSec=5
-
-[Install]
-WantedBy=default.target
