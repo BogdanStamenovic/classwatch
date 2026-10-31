@@ -142,6 +142,13 @@ check_server() {
 }
 
 server_remove() {
+  # Only units this checkout installed: a remove of a half-done install must not take down a
+  # server that another checkout (a dev clone, the old linked recipe) is still running.
+  if [ -L "$UNIT_DIR/classwatch-asr.service" ] \
+     || ! grep -qF "$DIR/.venv/bin/classwatch" "$UNIT_DIR/classwatch-asr.service" 2>/dev/null; then
+    say "classwatch-asr units are not from $DIR; left them alone"
+    return
+  fi
   systemctl --user stop classwatch-asr.socket classwatch-asr.service 2>/dev/null || true
   systemctl --user disable classwatch-asr.socket 2>/dev/null || true
   rm -f "$UNIT_DIR/classwatch-asr.service" "$UNIT_DIR/classwatch-asr.socket" \
