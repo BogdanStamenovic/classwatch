@@ -188,8 +188,12 @@ Testing without a class: `classwatch run --replay lesson.wav --dry-run` (16 kHz 
   it failed with 1.0 GB free on archserver's root and left the old install untouched.
 - **An update on archserver drops a request in flight**: it stops the running server so the new
   code takes over. Do not update during a class; the laptop falls back to its CPU model meanwhile.
-- **The client role has not been installed on the laptop yet** (as of 2026-10-31). It was run
-  only in a throwaway home directory on archserver, with no GNOME session and no audio sink.
+- **The client's remove has not run on the laptop**, only in a throwaway home directory: it
+  disables the extension in the live GNOME session, and re-enabling a deleted extension may
+  need a logout. Install, update and rollback were exercised there on 2026-11-01.
+- **The full pipeline was not re-run after the move to ownbox** (`run --replay` calls the paid
+  answer and Jev APIs). What was checked on the laptop: the extension connects over D-Bus, and
+  a real speech chunk transcribes on archserver with the copied token.
 - The extension needs one logout/login after install (GNOME Wayland discovers extensions at login).
 - On the CPU fallback, detection lag grows to ~10 s and transcripts are noticeably worse.
 - Answers come from a noisy transcript and can be wrong; the panel shows both models so a
